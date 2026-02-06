@@ -2511,7 +2511,12 @@ function Show-MDEIncidents {
             Write-Host "    [2] Assign to someone else"
             Write-Host "    [3] Update status"
             Write-Host "    [4] Close incident (Resolve)"
-            Write-Host "    [5] Back to incident list"
+            if ($alerts.Count -gt 0) {
+                Write-Host "    [5] View alert details ($($alerts.Count) alert$(if ($alerts.Count -ne 1) {'s'}))"
+            } else {
+                Write-Host "    [5] View alert details" -ForegroundColor DarkGray
+            }
+            Write-Host "    [6] Back to incident list"
             Write-Host ""
 
             $actionPick = Read-Host "  Action"
@@ -2734,9 +2739,269 @@ function Show-MDEIncidents {
                 }
 
                 # ==============================================================
-                # [5] BACK TO INCIDENT LIST
+                # [5] VIEW ALERT DETAILS
                 # ==============================================================
                 "5" {
+                    if ($alerts.Count -eq 0) {
+                        Write-Host "  No alerts on this incident." -ForegroundColor Yellow
+                        continue
+                    }
+
+                    $selectedAlert = $null
+
+                    if ($alerts.Count -eq 1) {
+                        $selectedAlert = $alerts[0]
+                    }
+                    else {
+                        Write-Host ""
+                        Write-Host "  Select an alert to view:" -ForegroundColor Cyan
+                        Write-Host ""
+                        $ai = 1
+                        foreach ($a in $alerts) {
+                            $aTitle = if ($a.title) { $a.title } else { "(no title)" }
+                            $aSev   = if ($a.severity) { $a.severity } else { "--" }
+                            $aSevC  = switch ($aSev) { "High" { "Red" } "Medium" { "Yellow" } "Low" { "Cyan" } "Informational" { "DarkGray" } default { "White" } }
+                            Write-Host "    [$ai] " -NoNewline -ForegroundColor White
+                            Write-Host "[$aSev]" -ForegroundColor $aSevC -NoNewline
+                            Write-Host " $aTitle" -ForegroundColor White
+                            $ai++
+                        }
+                        Write-Host "    [$ai] Cancel"
+                        Write-Host ""
+                        $alertPick = Read-Host "  Select"
+                        $alertIdx  = 0
+                        if (-not [int]::TryParse($alertPick, [ref]$alertIdx) -or $alertIdx -lt 1 -or $alertIdx -gt $alerts.Count) {
+                            Write-Host "  Cancelled." -ForegroundColor DarkGray
+                            continue
+                        }
+                        $selectedAlert = $alerts[$alertIdx - 1]
+                    }
+
+                    # -- Display full alert details --------------------------------
+                    Write-Host ""
+                    Write-Host "  --------------------------------------------------------" -ForegroundColor DarkGray
+                    Write-Host "  ALERT DETAILS" -ForegroundColor Cyan
+                    Write-Host "  --------------------------------------------------------" -ForegroundColor DarkGray
+
+                    $dTitle  = if ($selectedAlert.title)    { $selectedAlert.title }    else { "(no title)" }
+                    $dId     = if ($selectedAlert.alertId)  { $selectedAlert.alertId }  else { "--" }
+                    $dSev    = if ($selectedAlert.severity) { $selectedAlert.severity } else { "--" }
+                    $dSevC   = switch ($dSev) { "High" { "Red" } "Medium" { "Yellow" } "Low" { "Cyan" } "Informational" { "DarkGray" } default { "White" } }
+                    $dStatus = if ($selectedAlert.status)   { $selectedAlert.status }   else { "--" }
+
+                    Write-Host "  Title:          $dTitle" -ForegroundColor White
+                    Write-Host "  Alert ID:       $dId" -ForegroundColor DarkGray
+                    Write-Host "  Severity:       " -NoNewline
+                    Write-Host "$dSev" -ForegroundColor $dSevC
+                    Write-Host "  Status:         $dStatus"
+
+                    if ($selectedAlert.category) {
+                        Write-Host "  Category:       $($selectedAlert.category)"
+                    }
+                    if ($selectedAlert.serviceSource) {
+                        Write-Host "  Service source: $($selectedAlert.serviceSource)"
+                    }
+                    if ($selectedAlert.detectionSource) {
+                        Write-Host "  Detection src:  $($selectedAlert.detectionSource)"
+                    }
+                    if ($selectedAlert.classification -and $selectedAlert.classification -ne "Unknown") {
+                        Write-Host "  Classification: $($selectedAlert.classification)"
+                    }
+                    if ($selectedAlert.determination -and $selectedAlert.determination -ne "NotAvailable") {
+                        Write-Host "  Determination:  $($selectedAlert.determination)"
+                    }
+                    if ($selectedAlert.assignedTo) {
+                        Write-Host "  Assigned to:    $($selectedAlert.assignedTo)"
+                    }
+
+                    # Timestamps
+                    $dCreated  = if ($selectedAlert.createdTime)       { try { ([datetime]$selectedAlert.createdTime).ToString("yyyy-MM-dd HH:mm:ss") }       catch { $selectedAlert.createdTime } }       else { $null }
+                    $dUpdated  = if ($selectedAlert.lastUpdatedTime)   { try { ([datetime]$selectedAlert.lastUpdatedTime).ToString("yyyy-MM-dd HH:mm:ss") }   catch { $selectedAlert.lastUpdatedTime } }   else { $null }
+                    $dResolved = if ($selectedAlert.resolvedTime)      { try { ([datetime]$selectedAlert.resolvedTime).ToString("yyyy-MM-dd HH:mm:ss") }      catch { $selectedAlert.resolvedTime } }      else { $null }
+                    $dFirst    = if ($selectedAlert.firstActivity)     { try { ([datetime]$selectedAlert.firstActivity).ToString("yyyy-MM-dd HH:mm:ss") }     catch { $selectedAlert.firstActivity } }     else { $null }
+                    $dLast     = if ($selectedAlert.lastActivity)      { try { ([datetime]$selectedAlert.lastActivity).ToString("yyyy-MM-dd HH:mm:ss") }      catch { $selectedAlert.lastActivity } }      else { $null }
+
+                    Write-Host ""
+                    Write-Host "  -- Timeline --" -ForegroundColor DarkCyan
+                    if ($dCreated)  { Write-Host "  Created:        $dCreated" -ForegroundColor DarkGray }
+                    if ($dFirst)    { Write-Host "  First activity: $dFirst"   -ForegroundColor DarkGray }
+                    if ($dLast)     { Write-Host "  Last activity:  $dLast"    -ForegroundColor DarkGray }
+                    if ($dUpdated)  { Write-Host "  Last updated:   $dUpdated" -ForegroundColor DarkGray }
+                    if ($dResolved) { Write-Host "  Resolved:       $dResolved" -ForegroundColor DarkGray }
+
+                    # Description / recommended actions
+                    if ($selectedAlert.description) {
+                        Write-Host ""
+                        Write-Host "  -- Description --" -ForegroundColor DarkCyan
+                        Write-Host "  $($selectedAlert.description)" -ForegroundColor White
+                    }
+                    if ($selectedAlert.recommendedAction) {
+                        Write-Host ""
+                        Write-Host "  -- Recommended Action --" -ForegroundColor DarkCyan
+                        Write-Host "  $($selectedAlert.recommendedAction)" -ForegroundColor White
+                    }
+
+                    # Devices
+                    if ($selectedAlert.devices -and $selectedAlert.devices.Count -gt 0) {
+                        Write-Host ""
+                        Write-Host "  -- Devices ($($selectedAlert.devices.Count)) --" -ForegroundColor DarkCyan
+                        foreach ($dev in $selectedAlert.devices) {
+                            $devName  = if ($dev.deviceDnsName) { $dev.deviceDnsName } elseif ($dev.aadDeviceId) { $dev.aadDeviceId } else { $dev.deviceId }
+                            $devOS    = if ($dev.osPlatform) { $dev.osPlatform } else { "" }
+                            $devVer   = if ($dev.version)    { $dev.version }    else { "" }
+                            $devHealth = if ($dev.healthStatus) { $dev.healthStatus } else { "" }
+                            $devRisk   = if ($dev.riskScore)   { $dev.riskScore }   else { "" }
+                            $devIp     = if ($dev.lastIpAddress) { $dev.lastIpAddress } elseif ($dev.lastExternalIpAddress) { $dev.lastExternalIpAddress } else { "" }
+
+                            Write-Host "    Device:   $devName" -ForegroundColor White
+                            $devMeta = @()
+                            if ($devOS)     { $devMeta += "OS: $devOS" }
+                            if ($devVer)    { $devMeta += "Ver: $devVer" }
+                            if ($devHealth) { $devMeta += "Health: $devHealth" }
+                            if ($devRisk)   { $devMeta += "Risk: $devRisk" }
+                            if ($devIp)     { $devMeta += "IP: $devIp" }
+                            if ($devMeta.Count -gt 0) {
+                                Write-Host "              $($devMeta -join '  |  ')" -ForegroundColor DarkGray
+                            }
+
+                            # Show logged-on users for the device
+                            if ($dev.loggedOnUsers -and $dev.loggedOnUsers.Count -gt 0) {
+                                $userNames = ($dev.loggedOnUsers | ForEach-Object {
+                                    if ($_.accountName -and $_.domainName) { "$($_.domainName)\$($_.accountName)" }
+                                    elseif ($_.accountName) { $_.accountName }
+                                }) -join ", "
+                                if ($userNames) {
+                                    Write-Host "              Logged-on: $userNames" -ForegroundColor DarkGray
+                                }
+                            }
+                        }
+                    }
+
+                    # Entities (users, IPs, files, etc.)
+                    if ($selectedAlert.entities -and $selectedAlert.entities.Count -gt 0) {
+                        Write-Host ""
+                        Write-Host "  -- Entities ($($selectedAlert.entities.Count)) --" -ForegroundColor DarkCyan
+                        foreach ($ent in $selectedAlert.entities) {
+                            $entType = if ($ent.entityType) { $ent.entityType } else { "Unknown" }
+
+                            switch ($entType) {
+                                "User" {
+                                    $entName = if ($ent.userPrincipalName) { $ent.userPrincipalName }
+                                              elseif ($ent.accountName -and $ent.domainName) { "$($ent.domainName)\$($ent.accountName)" }
+                                              elseif ($ent.accountName) { $ent.accountName }
+                                              else { "(unknown user)" }
+                                    Write-Host "    User:     $entName" -ForegroundColor White
+                                }
+                                "Ip" {
+                                    $entIp = if ($ent.ipAddress) { $ent.ipAddress } else { "(unknown)" }
+                                    Write-Host "    IP:       $entIp" -ForegroundColor White
+                                }
+                                "Url" {
+                                    $entUrl = if ($ent.url) { $ent.url } else { "(unknown)" }
+                                    Write-Host "    URL:      $entUrl" -ForegroundColor White
+                                }
+                                "File" {
+                                    $entFile = if ($ent.fileName) { $ent.fileName } else { "(unknown)" }
+                                    $entHash = if ($ent.sha256) { $ent.sha256 } elseif ($ent.sha1) { $ent.sha1 } else { "" }
+                                    Write-Host "    File:     $entFile" -ForegroundColor White
+                                    if ($entHash) {
+                                        Write-Host "              Hash: $entHash" -ForegroundColor DarkGray
+                                    }
+                                }
+                                "Process" {
+                                    $entProc = if ($ent.fileName) { $ent.fileName } elseif ($ent.processId) { "PID $($ent.processId)" } else { "(unknown)" }
+                                    $entCmd  = if ($ent.processCommandLine) { $ent.processCommandLine } else { "" }
+                                    Write-Host "    Process:  $entProc" -ForegroundColor White
+                                    if ($ent.processId) {
+                                        Write-Host "              PID: $($ent.processId)" -ForegroundColor DarkGray
+                                    }
+                                    # Process creation time
+                                    if ($ent.processCreationTime -and "$($ent.processCreationTime)" -ne "") {
+                                        $procTimeStr = "$($ent.processCreationTime)"
+                                        $procTimeDisplay = try { ([datetime]::Parse($procTimeStr)).ToString("yyyy-MM-dd HH:mm:ss") } catch { $procTimeStr }
+                                        Write-Host "              Time: $procTimeDisplay" -ForegroundColor DarkGray
+                                    }
+                                    if ($entCmd) {
+                                        $displayCmd = if ($entCmd.Length -gt 120) { $entCmd.Substring(0, 117) + "..." } else { $entCmd }
+                                        Write-Host "              Cmd: $displayCmd" -ForegroundColor DarkGray
+                                    }
+                                    # Account
+                                    $acctDisplay = if ($ent.accountName -and $ent.domainName) { "$($ent.domainName)\$($ent.accountName)" }
+                                                   elseif ($ent.accountName) { $ent.accountName }
+                                                   else { "--" }
+                                    Write-Host "              Account: $acctDisplay" -ForegroundColor DarkGray
+                                    # Verdict
+                                    $verdictText   = if ($ent.verdict) { $ent.verdict } else { "--" }
+                                    $verdictColour = switch ($verdictText) { "Malicious" { "Red" } "Suspicious" { "Yellow" } "Clean" { "Green" } default { "DarkGray" } }
+                                    Write-Host "              Verdict: " -NoNewline -ForegroundColor DarkGray
+                                    Write-Host "$verdictText" -ForegroundColor $verdictColour
+                                    # File hashes
+                                    if ($ent.sha256) { Write-Host "              SHA256: $($ent.sha256)" -ForegroundColor DarkGray }
+                                    elseif ($ent.sha1) { Write-Host "              SHA1: $($ent.sha1)" -ForegroundColor DarkGray }
+                                    # Parent process
+                                    if ($ent.parentProcessId) {
+                                        Write-Host "              Parent PID: $($ent.parentProcessId)" -ForegroundColor DarkGray
+                                    }
+                                    if ($ent.parentProcessCreationTime -and "$($ent.parentProcessCreationTime)" -ne "") {
+                                        $parentTimeStr = "$($ent.parentProcessCreationTime)"
+                                        $parentTimeDisplay = try { ([datetime]::Parse($parentTimeStr)).ToString("yyyy-MM-dd HH:mm:ss") } catch { $parentTimeStr }
+                                        Write-Host "              Parent time: $parentTimeDisplay" -ForegroundColor DarkGray
+                                    }
+                                }
+                                "MailMessage" {
+                                    $entSubj   = if ($ent.subject) { $ent.subject } else { "(no subject)" }
+                                    $entSender = if ($ent.sender)  { $ent.sender }  else { "" }
+                                    Write-Host "    Email:    $entSubj" -ForegroundColor White
+                                    if ($entSender) {
+                                        Write-Host "              From: $entSender" -ForegroundColor DarkGray
+                                    }
+                                }
+                                "Mailbox" {
+                                    $entMbx = if ($ent.mailboxPrimaryAddress) { $ent.mailboxPrimaryAddress }
+                                              elseif ($ent.mailboxDisplayName) { $ent.mailboxDisplayName }
+                                              else { "(unknown)" }
+                                    Write-Host "    Mailbox:  $entMbx" -ForegroundColor White
+                                }
+                                "Registry" {
+                                    $entKey = if ($ent.registryKey) { $ent.registryKey } else { "(unknown)" }
+                                    $entVal = if ($ent.registryValueName) { $ent.registryValueName } else { "" }
+                                    Write-Host "    Registry: $entKey" -ForegroundColor White
+                                    if ($entVal) {
+                                        Write-Host "              Value: $entVal" -ForegroundColor DarkGray
+                                    }
+                                }
+                                default {
+                                    Write-Host "    [$entType]: " -ForegroundColor White -NoNewline
+                                    # Try common name fields
+                                    $entLabel = if ($ent.fileName) { $ent.fileName }
+                                                elseif ($ent.accountName) { $ent.accountName }
+                                                elseif ($ent.ipAddress) { $ent.ipAddress }
+                                                elseif ($ent.url) { $ent.url }
+                                                else { "(details not available)" }
+                                    Write-Host "$entLabel" -ForegroundColor DarkGray
+                                }
+                            }
+                        }
+                    }
+
+                    # Investigation state
+                    if ($selectedAlert.investigationState) {
+                        Write-Host ""
+                        Write-Host "  Investigation:  $($selectedAlert.investigationState)" -ForegroundColor DarkCyan
+                    }
+                    if ($selectedAlert.investigationId) {
+                        Write-Host "  Investigation ID: $($selectedAlert.investigationId)" -ForegroundColor DarkGray
+                    }
+
+                    Write-Host ""
+                    Write-Host "  --------------------------------------------------------" -ForegroundColor DarkGray
+                    Read-Host "  Press Enter to return to incident actions"
+                }
+
+                # ==============================================================
+                # [6] BACK TO INCIDENT LIST
+                # ==============================================================
+                "6" {
                     $backToList = $true
                 }
 
