@@ -3026,6 +3026,71 @@ while (-not $exitScript) {
     Write-Host "============================================================" -ForegroundColor DarkGray
     Write-Host "  MAIN MENU" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor DarkGray
+
+    # -- Incident summary (if MDE connected) -----------------------------------
+    if ($mdeConnected) {
+        try {
+            $incSummary = Invoke-MDERequest -Method GET `
+                -Endpoint "/api/incidents?`$filter=status eq 'Active'&`$top=50"
+
+            if ($incSummary -and $incSummary.value -and $incSummary.value.Count -gt 0) {
+                $activeIncs = @($incSummary.value)
+                $totalActive = $activeIncs.Count
+
+                # Group alerts across all incidents by category
+                $catCounts = @{}
+                $sevCounts = @{ "High" = 0; "Medium" = 0; "Low" = 0; "Informational" = 0 }
+                foreach ($inc in $activeIncs) {
+                    if ($inc.alerts) {
+                        foreach ($al in $inc.alerts) {
+                            $cat = if ($al.category) { $al.category } else { "Uncategorised" }
+                            if ($catCounts.ContainsKey($cat)) { $catCounts[$cat]++ } else { $catCounts[$cat] = 1 }
+                        }
+                    }
+                    # Severity counts at incident level
+                    $sev = if ($inc.severity) { $inc.severity } else { "Informational" }
+                    if ($sevCounts.ContainsKey($sev)) { $sevCounts[$sev]++ } else { $sevCounts[$sev] = 1 }
+                }
+
+                Write-Host ""
+                Write-Host "  INCIDENT SUMMARY" -ForegroundColor Yellow
+                Write-Host "  Active incidents: " -NoNewline
+                $totalColour = if ($sevCounts["High"] -gt 0) { "Red" } elseif ($sevCounts["Medium"] -gt 0) { "Yellow" } else { "White" }
+                Write-Host "$totalActive" -ForegroundColor $totalColour -NoNewline
+
+                # Inline severity breakdown
+                $sevParts = @()
+                if ($sevCounts["High"] -gt 0)          { $sevParts += "$($sevCounts['High']) High" }
+                if ($sevCounts["Medium"] -gt 0)        { $sevParts += "$($sevCounts['Medium']) Medium" }
+                if ($sevCounts["Low"] -gt 0)           { $sevParts += "$($sevCounts['Low']) Low" }
+                if ($sevCounts["Informational"] -gt 0) { $sevParts += "$($sevCounts['Informational']) Info" }
+                if ($sevParts.Count -gt 0) {
+                    Write-Host "  ($($sevParts -join ', '))" -ForegroundColor DarkGray
+                } else {
+                    Write-Host ""
+                }
+
+                # Category breakdown
+                $sortedCats = $catCounts.GetEnumerator() | Sort-Object Value -Descending
+                foreach ($c in $sortedCats) {
+                    Write-Host "    $($c.Value) " -NoNewline -ForegroundColor White
+                    Write-Host "$($c.Key)" -ForegroundColor DarkCyan
+                }
+            }
+            else {
+                Write-Host ""
+                Write-Host "  INCIDENT SUMMARY" -ForegroundColor Yellow
+                Write-Host "  No active incidents." -ForegroundColor Green
+            }
+        }
+        catch {
+            Write-Host ""
+            Write-Host "  INCIDENT SUMMARY" -ForegroundColor Yellow
+            Write-Host "  Could not fetch incidents." -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ""
     Write-Host "    [1] Search for a user"
     Write-Host "    [2] Search for a device (MDE)" -ForegroundColor $(if ($mdeConnected) { "White" } else { "DarkGray" })
 
