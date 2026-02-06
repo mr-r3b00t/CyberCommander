@@ -3,19 +3,18 @@
 <#
 .SYNOPSIS
     Interactive user and device management tool for Entra ID, Active Directory,
-    Intune, and Microsoft Defender for Endpoint (MDE).
+    and Microsoft Defender for Endpoint (MDE).
     Supports multiple MDE sign-in methods: Interactive Browser (passkey/FIDO2/Hello),
     Device Code, and WAM (Windows SSO).
 
 .DESCRIPTION
-    Connects to Microsoft Graph (Entra ID / Intune), Active Directory, and the
-    MDE API to:
+    Connects to Microsoft Graph (Entra ID), Active Directory, and the MDE API to:
 
     Main menu:
       [1] Search for a user   - view info, take user actions, drill into devices
       [2] Search for a device - search MDE-onboarded machines, take device actions
       [3] Connect to MDE      - connect or reconnect to Defender for Endpoint
-      [4] Connect to AD       - connect or reconnect to Active Directory
+      [4] View active incidents - list non-resolved MDE/Defender XDR incidents
       [5] Exit
 
     User actions:
@@ -27,41 +26,15 @@
       - Select a linked device for device actions
 
     Device actions (from user context or device search):
-      MDE (requires MDE onboarding):
-        - Isolate device (Full)
-        - Isolate device (Selective)
-        - Release from isolation
-      Intune (actions vary by device category):
-        Corporate Windows PC:
-          Sync, Restart, Defender Scan (Quick/Full), Fresh Start, Retire, Wipe
-        Personal/BYOD Windows PC:
-          Sync, Restart, Retire
-        Corporate Mobile (iOS/Android):
-          Sync, Remote Lock, Restart, Retire, Wipe
-          (+Lost Mode for supervised iOS)
-        Personal Mobile (iOS/Android):
-          Sync, Remote Lock, Retire
-        Corporate macOS:
-          Sync, Restart, Remote Lock, Retire, Wipe
-        Personal macOS:
-          Sync, Retire
-      Composite:
-        - Offboard Device: guided workflow that chains the appropriate
-          steps -- Intune Wipe/Retire (based on ownership), MDE isolation,
-          disable Entra device object, and revoke user sessions.
-          Each step is individually prompted.
-
-    Devices enrolled in Intune but not onboarded to MDE will still show
-    Entra + Intune detail and offer Intune actions.
+      - Isolate device (MDE - Full)
+      - Isolate device (MDE - Selective)
+      - Release from isolation (MDE)
 
 .NOTES
     Required Graph permissions (Delegated):
       - User.ReadWrite.All
       - Directory.ReadWrite.All
       - Device.Read.All
-      - DeviceManagementManagedDevices.Read.All        (Intune device detail)
-      - DeviceManagementManagedDevices.PrivilegedOperations.All  (Intune actions)
-      - AuditLog.Read.All                              (Sign-in logs -- requires Entra ID P1/P2)
 
     Required MDE API permissions (Delegated):
       - Machine.Read.All
@@ -83,12 +56,19 @@
 
     Required AD permissions:
       - Account Operator or equivalent (password reset, disable, set pwd flags)
+      - When connecting manually: credentials with the above permissions on
+        the target domain, and network access to the domain controller.
 
     AD connectivity:
-      - Domain-joined machines auto-discover a DC.
-      - Hybrid Azure AD Joined machines that cannot auto-discover are
-        prompted for a domain / DC FQDN (cached credentials are used).
-      - Non-joined machines are prompted for domain, username, and password.
+      - Tries automatic domain discovery first (works when domain-joined).
+      - If discovery fails (non-domain-joined, DC unreachable, VPN, etc.),
+        offers manual connection by specifying a DC FQDN/IP and credentials.
+      - Manual connection uses $PSDefaultParameterValues so all AD cmdlets
+        automatically inherit the -Server and -Credential settings.
+      - On successful manual connection, saves DC address, domain name, and
+        username to ad-connection.json alongside the script. On subsequent
+        runs the saved settings are offered as a quick-connect option.
+        Passwords are never saved to disk.
 
     Required PowerShell modules (auto-installed if missing):
       - Microsoft.Graph.Users
@@ -332,83 +312,6 @@ function Test-Prerequisites {
 }
 
 # ==============================================================================
-# FUNCTIONS -- CONFIG PERSISTENCE
-# ==============================================================================
-
-function Get-ConfigPath {
-    <#
-    .SYNOPSIS
-        Returns the path to config.json, stored alongside the running script.
-        Falls back to $HOME if the script path cannot be determined.
-    #>
-    $scriptDir = $null
-
-    # $PSScriptRoot is set when running a .ps1 file
-    if ($PSScriptRoot) {
-        $scriptDir = $PSScriptRoot
-    }
-    # Fallback: try $MyInvocation from the script scope
-    elseif ($script:MyInvocation -and $script:MyInvocation.MyCommand -and $script:MyInvocation.MyCommand.Path) {
-        $scriptDir = Split-Path -Parent $script:MyInvocation.MyCommand.Path
-    }
-
-    if (-not $scriptDir) { $scriptDir = $HOME }
-
-    return Join-Path $scriptDir "config.json"
-}
-
-function Read-Config {
-    <#
-    .SYNOPSIS
-        Reads config.json and returns a hashtable. Returns an empty hashtable
-        if the file does not exist or is invalid.
-    #>
-    $path = Get-ConfigPath
-
-    if (-not (Test-Path $path)) { return @{} }
-
-    try {
-        $json = Get-Content -Path $path -Raw -ErrorAction Stop
-        $obj  = $json | ConvertFrom-Json -ErrorAction Stop
-
-        # Convert PSCustomObject to hashtable for easy use
-        $config = @{}
-        foreach ($prop in $obj.PSObject.Properties) {
-            $config[$prop.Name] = $prop.Value
-        }
-        return $config
-    }
-    catch {
-        Write-Host "  Warning: Could not read config.json -- $_" -ForegroundColor DarkYellow
-        return @{}
-    }
-}
-
-function Save-Config {
-    <#
-    .SYNOPSIS
-        Saves a hashtable to config.json, merging with any existing values.
-        Only non-sensitive data should be saved (domain, username -- never passwords).
-    #>
-    param([hashtable]$NewValues)
-
-    $path   = Get-ConfigPath
-    $config = Read-Config
-
-    foreach ($key in $NewValues.Keys) {
-        $config[$key] = $NewValues[$key]
-    }
-
-    try {
-        $config | ConvertTo-Json -Depth 4 | Set-Content -Path $path -Encoding UTF8 -Force -ErrorAction Stop
-        Write-Host "  Config saved to $path" -ForegroundColor DarkGray
-    }
-    catch {
-        Write-Host "  Warning: Could not save config.json -- $_" -ForegroundColor DarkYellow
-    }
-}
-
-# ==============================================================================
 # FUNCTIONS -- CONNECTION
 # ==============================================================================
 
@@ -420,14 +323,11 @@ function Connect-ToGraph {
         $context = Get-MgContext
         if ($null -ne $context -and ($context.Account -or $context.ClientId)) {
             $currentScopes = $context.Scopes
-            $hasUserWrite    = ($currentScopes -contains "User.ReadWrite.All") -or ($currentScopes -contains "Directory.ReadWrite.All")
-            $hasUserRead     = ($currentScopes -contains "User.Read.All") -or ($currentScopes -contains "Directory.Read.All") -or $hasUserWrite
-            $hasDeviceRead   = ($currentScopes -contains "Device.Read.All") -or ($currentScopes -contains "Directory.Read.All") -or ($currentScopes -contains "Directory.ReadWrite.All")
-            $hasIntuneRead   = ($currentScopes -contains "DeviceManagementManagedDevices.Read.All") -or ($currentScopes -contains "DeviceManagementManagedDevices.ReadWrite.All")
-            $hasIntuneAction = ($currentScopes -contains "DeviceManagementManagedDevices.PrivilegedOperations.All")
-            $hasAuditLog     = ($currentScopes -contains "AuditLog.Read.All")
+            $hasUserWrite  = ($currentScopes -contains "User.ReadWrite.All") -or ($currentScopes -contains "Directory.ReadWrite.All")
+            $hasUserRead   = ($currentScopes -contains "User.Read.All") -or ($currentScopes -contains "Directory.Read.All") -or $hasUserWrite
+            $hasDeviceRead = ($currentScopes -contains "Device.Read.All") -or ($currentScopes -contains "Directory.Read.All") -or ($currentScopes -contains "Directory.ReadWrite.All")
 
-            if ($hasUserWrite -and $hasUserRead -and $hasDeviceRead -and $hasIntuneRead -and $hasIntuneAction -and $hasAuditLog) {
+            if ($hasUserWrite -and $hasUserRead -and $hasDeviceRead) {
                 try {
                     Get-MgOrganization -Top 1 -ErrorAction Stop | Out-Null
                     $sessionId = if ($context.Account) { $context.Account } else { "AppId: $($context.ClientId)" }
@@ -441,11 +341,8 @@ function Connect-ToGraph {
             }
             else {
                 $missing = @()
-                if (-not $hasUserWrite)    { $missing += "User.ReadWrite.All or Directory.ReadWrite.All" }
-                if (-not $hasDeviceRead)   { $missing += "Device.Read.All or Directory.Read.All" }
-                if (-not $hasIntuneRead)   { $missing += "DeviceManagementManagedDevices.Read.All" }
-                if (-not $hasIntuneAction) { $missing += "DeviceManagementManagedDevices.PrivilegedOperations.All" }
-                if (-not $hasAuditLog)     { $missing += "AuditLog.Read.All" }
+                if (-not $hasUserWrite)  { $missing += "User.ReadWrite.All or Directory.ReadWrite.All" }
+                if (-not $hasDeviceRead) { $missing += "Device.Read.All or Directory.Read.All" }
                 Write-Host "Session missing scopes: $($missing -join ', ')" -ForegroundColor Yellow
                 Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
             }
@@ -457,228 +354,27 @@ function Connect-ToGraph {
 
     if ($needsConnect) {
         Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-        Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.ReadWrite.All", "Device.Read.All", "DeviceManagementManagedDevices.Read.All", "DeviceManagementManagedDevices.PrivilegedOperations.All", "AuditLog.Read.All" -ErrorAction Stop
+        Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.ReadWrite.All", "Device.Read.All" -ErrorAction Stop
         $ctx = Get-MgContext
         $id = if ($ctx.Account) { $ctx.Account } else { "AppId: $($ctx.ClientId)" }
         Write-Host "Connected to Graph as $id." -ForegroundColor Green
     }
 }
 
-function Ensure-GraphCLIConsent {
-    <#
-    .SYNOPSIS
-        Checks whether admin consent has been granted for the Microsoft Graph
-        Command Line Tools enterprise application (the app used by Connect-MgGraph)
-        for the scopes this script requires. If consent is missing, it creates or
-        updates an oauth2PermissionGrant to cover the required scopes.
-
-        Requires: DelegatedPermissionGrant.ReadWrite.All (or Global/App Admin role).
-        If the current session lacks that scope, the function will attempt to
-        reconnect with the additional permission.
-    #>
-
-    Write-Host ""
-    Write-Host "Checking admin consent for Microsoft Graph Command Line Tools..." -ForegroundColor Cyan
-
-    # Well-known App IDs
-    $graphCLIAppId   = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph Command Line Tools
-    $msGraphAppId    = "00000003-0000-0000-c000-000000000000"  # Microsoft Graph
-
-    # The scopes this script needs
-    $requiredScopes = @(
-        "User.ReadWrite.All",
-        "Directory.ReadWrite.All",
-        "Device.Read.All",
-        "DeviceManagementManagedDevices.Read.All",
-        "DeviceManagementManagedDevices.PrivilegedOperations.All",
-        "AuditLog.Read.All"
-    )
-
-    # -- Look up the Graph CLI service principal in the tenant -----------------
-    try {
-        $cliSPResult = Invoke-MgGraphRequest -Method GET `
-            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$graphCLIAppId'" `
-            -ErrorAction Stop
-
-        if (-not $cliSPResult.value -or $cliSPResult.value.Count -eq 0) {
-            Write-Host "  Microsoft Graph Command Line Tools service principal not found in tenant." -ForegroundColor Yellow
-            Write-Host "  This is created automatically when Connect-MgGraph is first used." -ForegroundColor DarkGray
-            Write-Host "  Skipping consent check." -ForegroundColor DarkGray
-            return
-        }
-
-        $cliSP = $cliSPResult.value[0]
-    }
-    catch {
-        Write-Host "  Could not query service principals: $_" -ForegroundColor Yellow
-        Write-Host "  Skipping consent check." -ForegroundColor DarkGray
-        return
-    }
-
-    # -- Look up the Microsoft Graph resource service principal ----------------
-    try {
-        $graphSPResult = Invoke-MgGraphRequest -Method GET `
-            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$msGraphAppId'" `
-            -ErrorAction Stop
-
-        if (-not $graphSPResult.value -or $graphSPResult.value.Count -eq 0) {
-            Write-Host "  Microsoft Graph service principal not found. Skipping consent check." -ForegroundColor Yellow
-            return
-        }
-
-        $graphSP = $graphSPResult.value[0]
-    }
-    catch {
-        Write-Host "  Could not look up Microsoft Graph service principal: $_" -ForegroundColor Yellow
-        return
-    }
-
-    # -- Check existing oauth2PermissionGrants for the CLI app -----------------
-    try {
-        $existingGrants = Invoke-MgGraphRequest -Method GET `
-            -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=clientId eq '$($cliSP.id)' and resourceId eq '$($graphSP.id)' and consentType eq 'AllPrincipals'" `
-            -ErrorAction Stop
-    }
-    catch {
-        Write-Host "  Could not query existing permission grants: $_" -ForegroundColor Yellow
-        Write-Host "  Skipping consent check." -ForegroundColor DarkGray
-        return
-    }
-
-    $existingGrant = $null
-    $existingScopeList = @()
-
-    if ($existingGrants.value -and $existingGrants.value.Count -gt 0) {
-        $existingGrant = $existingGrants.value[0]
-        $existingScopeList = @($existingGrant.scope -split '\s+' | Where-Object { $_ -ne '' })
-    }
-
-    # Determine which required scopes are missing
-    $missingScopes = @($requiredScopes | Where-Object { $_ -notin $existingScopeList })
-
-    if ($missingScopes.Count -eq 0) {
-        Write-Host "  Admin consent already granted for all required scopes." -ForegroundColor Green
-        return
-    }
-
-    Write-Host "  Missing admin consent for: $($missingScopes -join ', ')" -ForegroundColor Yellow
-
-    # -- Ensure current session has DelegatedPermissionGrant.ReadWrite.All ------
-    $ctx = Get-MgContext
-    $currentScopes = @($ctx.Scopes)
-
-    if ("DelegatedPermissionGrant.ReadWrite.All" -notin $currentScopes) {
-        Write-Host "  Your Graph session needs DelegatedPermissionGrant.ReadWrite.All to grant consent." -ForegroundColor Yellow
-        Write-Host "  You will be prompted to re-authenticate with the additional scope." -ForegroundColor Yellow
-        Write-Host ""
-
-        $scopeConfirm = Read-Host "  Reconnect Graph with extra scope to grant consent? (Y/N)"
-        if ($scopeConfirm -ne "Y" -and $scopeConfirm -ne "y") {
-            Write-Host "  Skipping consent grant. Users may be prompted to consent individually." -ForegroundColor DarkGray
-            return
-        }
-
-        try {
-            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-            $allScopes = @(
-                "User.ReadWrite.All",
-                "Directory.ReadWrite.All",
-                "Device.Read.All",
-                "DeviceManagementManagedDevices.Read.All",
-                "DeviceManagementManagedDevices.PrivilegedOperations.All",
-                "AuditLog.Read.All",
-                "DelegatedPermissionGrant.ReadWrite.All"
-            )
-            Connect-MgGraph -Scopes $allScopes -ErrorAction Stop
-            Write-Host "  Graph reconnected with additional scope." -ForegroundColor Green
-        }
-        catch {
-            Write-Warning "  Failed to reconnect: $_"
-            Write-Host "  Attempting to reconnect with original scopes..." -ForegroundColor Yellow
-            try {
-                Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.ReadWrite.All", "Device.Read.All", "DeviceManagementManagedDevices.Read.All", "DeviceManagementManagedDevices.PrivilegedOperations.All", "AuditLog.Read.All" -ErrorAction Stop
-            } catch {}
-            return
-        }
-    }
-
-    # -- Grant or update consent ------------------------------------------------
-    $newScopeString = (($existingScopeList + $missingScopes) | Sort-Object -Unique) -join ' '
-
-    if ($existingGrant) {
-        # Update the existing grant to include missing scopes
-        Write-Host "  Updating existing admin consent grant..." -ForegroundColor Cyan -NoNewline
-
-        try {
-            Invoke-MgGraphRequest -Method PATCH `
-                -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($existingGrant.id)" `
-                -Body (@{ scope = $newScopeString } | ConvertTo-Json) `
-                -ContentType "application/json" `
-                -ErrorAction Stop | Out-Null
-
-            Write-Host " Done" -ForegroundColor Green
-            Write-Host "  Admin consent granted for: $newScopeString" -ForegroundColor Green
-        }
-        catch {
-            Write-Host " FAILED" -ForegroundColor Red
-            Write-Warning "  Error updating consent grant: $_"
-            Write-Host "  Users may be prompted to consent individually." -ForegroundColor Yellow
-        }
-    }
-    else {
-        # Create a new admin consent grant
-        Write-Host "  Creating admin consent grant..." -ForegroundColor Cyan -NoNewline
-
-        $grantBody = @{
-            clientId    = $cliSP.id
-            consentType = "AllPrincipals"
-            resourceId  = $graphSP.id
-            scope       = $newScopeString
-        }
-
-        try {
-            Invoke-MgGraphRequest -Method POST `
-                -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" `
-                -Body ($grantBody | ConvertTo-Json) `
-                -ContentType "application/json" `
-                -ErrorAction Stop | Out-Null
-
-            Write-Host " Done" -ForegroundColor Green
-            Write-Host "  Admin consent granted for: $newScopeString" -ForegroundColor Green
-        }
-        catch {
-            Write-Host " FAILED" -ForegroundColor Red
-            Write-Warning "  Error creating consent grant: $_"
-            Write-Host "  Users may be prompted to consent individually." -ForegroundColor Yellow
-        }
-    }
-}
-
 function Connect-ToAD {
     <#
     .SYNOPSIS
-        Connects to Active Directory. Tries automatic domain discovery first.
-        If that fails, checks whether the machine is Hybrid Azure AD Joined
-        (in which case it prompts only for a domain/DC name) or not joined at
-        all (in which case it prompts for domain, username, and password).
-
-        Saved defaults (domain, username) are loaded from config.json and
-        offered as defaults in the prompts. On successful connection the
-        values are saved back to config.json for next time.
-        Passwords are NEVER saved.
-
-        Stores connection parameters in script-scoped variables:
-          $script:adServer     - the DC / domain to target with -Server
-          $script:adCredential - PSCredential (or $null if using current user)
-
-        All subsequent AD cmdlet calls should use Get-ADConnectionParams to
-        obtain the correct -Server / -Credential splat.
+        Connects to Active Directory. Tries automatic discovery first; if that
+        fails, offers the user the option to specify a domain controller and
+        credentials manually.
+        Stores connection details via $PSDefaultParameterValues so every AD
+        cmdlet in the session automatically inherits -Server / -Credential.
+        Saves manual connection settings (DC, domain, username) to a JSON file
+        alongside the script so they persist between runs. Passwords are never
+        saved -- only the username is stored for the credential prompt.
     #>
-    Write-Host "Checking Active Directory module and connectivity..." -ForegroundColor Cyan
 
-    # Reset script-scoped AD connection params
-    $script:adServer     = $null
-    $script:adCredential = $null
+    Write-Host "Checking Active Directory module and connectivity..." -ForegroundColor Cyan
 
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
         Write-Error "ActiveDirectory module is not installed. Install RSAT or the AD PowerShell module."
@@ -687,12 +383,21 @@ function Connect-ToAD {
 
     Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 
-    # -- Load saved defaults from config.json -----------------------------------
-    $savedConfig   = Read-Config
-    $savedDomain   = if ($savedConfig['ADDomain'])   { $savedConfig['ADDomain'] }   else { $null }
-    $savedUsername  = if ($savedConfig['ADUsername'])  { $savedConfig['ADUsername'] }  else { $null }
+    # -- Helper: clear any previous AD default parameter values ----------------
+    $adCmdlets = @(
+        "Get-ADDomain", "Get-ADDomainController", "Get-ADUser",
+        "Set-ADUser", "Set-ADAccountPassword",
+        "Disable-ADAccount", "Unlock-ADAccount"
+    )
+    foreach ($cmd in $adCmdlets) {
+        $PSDefaultParameterValues.Remove("${cmd}:Server")
+        $PSDefaultParameterValues.Remove("${cmd}:Credential")
+    }
 
-    # -- Attempt 1: Automatic domain discovery (machine is domain-joined & can reach a DC)
+    # -- Config file path (same folder as the script) --------------------------
+    $adConfigPath = Join-Path $PSScriptRoot "ad-connection.json"
+
+    # -- Attempt 1: automatic domain discovery ---------------------------------
     try {
         Get-ADDomainController -Discover -ErrorAction Stop | Out-Null
         $domain = (Get-ADDomain -ErrorAction Stop).DNSRoot
@@ -700,196 +405,155 @@ function Connect-ToAD {
         return $true
     }
     catch {
-        Write-Host "  Automatic domain discovery failed." -ForegroundColor Yellow
+        Write-Host "  Auto-discovery failed: $_" -ForegroundColor Yellow
     }
 
-    # -- Attempt 2: Detect device join state via dsregcmd ----------------------------
-    Write-Host "  Checking device join state..." -ForegroundColor Cyan
-
-    $isAzureADJoined = $false
-    $isDomainJoined  = $false
-
-    try {
-        $dsregOutput = dsregcmd /status 2>&1 | Out-String
-
-        if ($dsregOutput -match 'AzureAdJoined\s*:\s*YES')  { $isAzureADJoined = $true }
-        if ($dsregOutput -match 'DomainJoined\s*:\s*YES')   { $isDomainJoined  = $true }
-    }
-    catch {
-        Write-Host "  Could not run dsregcmd. Assuming non-joined workstation." -ForegroundColor DarkGray
-    }
-
-    $isHybridJoined = ($isAzureADJoined -and $isDomainJoined)
-
-    if ($isHybridJoined) {
-        # -------------------------------------------------------------------
-        # HYBRID JOINED: machine has a domain trust but can't auto-discover
-        # a DC (e.g. VPN not connected, DNS issue). Ask for domain / DC only;
-        # the user's cached Windows credentials should work.
-        # -------------------------------------------------------------------
-        Write-Host ""
-        Write-Host "  Device is Hybrid Azure AD Joined." -ForegroundColor Cyan
-        Write-Host "  Auto-discovery failed (DC may not be reachable via default DNS)." -ForegroundColor Yellow
-        Write-Host "  Please provide a domain name or domain controller FQDN." -ForegroundColor White
-        Write-Host ""
-
-        $domainPrompt = "  Domain or DC FQDN (e.g. corp.contoso.com)"
-        if ($savedDomain) {
-            $domainPrompt += " [$savedDomain]"
-        }
-
-        $adServerInput = Read-Host $domainPrompt
-
-        if ([string]::IsNullOrWhiteSpace($adServerInput)) {
-            if ($savedDomain) {
-                $adServerInput = $savedDomain
-                Write-Host "  Using saved domain: $savedDomain" -ForegroundColor DarkGray
-            }
-            else {
-                Write-Host "  No domain entered. AD actions will be unavailable." -ForegroundColor Red
-                return $false
-            }
-        }
-
-        $script:adServer = $adServerInput.Trim()
-
-        Write-Host "  Testing connectivity to $($script:adServer)..." -ForegroundColor Cyan -NoNewline
-
+    # -- Check for saved connection settings -----------------------------------
+    $savedConfig = $null
+    if (Test-Path $adConfigPath) {
         try {
-            Get-ADDomainController -DomainName $script:adServer -Discover -ErrorAction Stop | Out-Null
-            Write-Host " OK" -ForegroundColor Green
+            $savedConfig = Get-Content -Path $adConfigPath -Raw | ConvertFrom-Json
         }
         catch {
-            # Fall back to direct -Server; discovery may fail but the cmdlet might still work
-            Write-Host " Discovery failed, will try direct connection." -ForegroundColor Yellow
+            Write-Host "  Could not read saved AD config: $_" -ForegroundColor DarkGray
+            $savedConfig = $null
         }
+    }
 
-        try {
-            $adDomain = Get-ADDomain -Server $script:adServer -ErrorAction Stop
-            Write-Host "  Connected to Active Directory domain: $($adDomain.DNSRoot)" -ForegroundColor Green
+    # -- Attempt 2: let user specify a DC / domain manually --------------------
+    Write-Host ""
+    Write-Host "  Automatic domain discovery was unsuccessful." -ForegroundColor Yellow
+    Write-Host "  This usually means the machine is not domain-joined," -ForegroundColor DarkGray
+    Write-Host "  or the domain controller is not reachable on this network." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  You can connect manually by providing a domain controller" -ForegroundColor White
+    Write-Host "  FQDN or IP address, and credentials for that domain." -ForegroundColor White
+    Write-Host ""
 
-            # Save domain to config for next time
-            Save-Config @{ ADDomain = $script:adServer }
-
-            return $true
-        }
-        catch {
-            Write-Host "  Failed to connect to $($script:adServer): $_" -ForegroundColor Red
-            Write-Host "  AD actions will be unavailable." -ForegroundColor Red
-            $script:adServer = $null
-            return $false
-        }
+    if ($savedConfig) {
+        Write-Host "    [1] Use saved connection: $($savedConfig.Server)" -ForegroundColor Cyan
+        Write-Host "        Domain: $($savedConfig.Domain) | User: $($savedConfig.Username)" -ForegroundColor DarkCyan
+        Write-Host "    [2] Specify a new domain controller"
+        Write-Host "    [3] Skip AD (Entra-only mode)"
     }
     else {
-        # -------------------------------------------------------------------
-        # NOT HYBRID JOINED (cloud-only, workgroup, or Azure AD Joined only).
-        # Need full credentials: domain, username, password.
-        # -------------------------------------------------------------------
-        $joinState = if ($isAzureADJoined) { "Azure AD Joined (cloud-only)" } else { "Not domain-joined" }
-        Write-Host ""
-        Write-Host "  Device join state: $joinState" -ForegroundColor Yellow
-        Write-Host "  To use AD features, provide a domain controller and credentials." -ForegroundColor White
-        Write-Host ""
+        Write-Host "    [1] Specify a domain controller manually"
+        Write-Host "    [2] Skip AD (Entra-only mode)"
+    }
+    Write-Host ""
 
-        $domainPrompt = "  Domain or DC FQDN (e.g. corp.contoso.com)"
-        if ($savedDomain) {
-            $domainPrompt += " [$savedDomain]"
-        }
-        $domainPrompt += " [Enter to skip]"
+    $adChoice = Read-Host "  Select"
 
-        $adServerInput = Read-Host $domainPrompt
-
-        if ([string]::IsNullOrWhiteSpace($adServerInput)) {
-            if ($savedDomain) {
-                $adServerInput = $savedDomain
-                Write-Host "  Using saved domain: $savedDomain" -ForegroundColor DarkGray
-            }
-            else {
-                Write-Host "  Skipping AD connection." -ForegroundColor DarkGray
-                return $false
-            }
-        }
-
-        $script:adServer = $adServerInput.Trim()
+    # -- Route: use saved settings ---------------------------------------------
+    if ($savedConfig -and $adChoice -eq "1") {
+        $dcInput   = $savedConfig.Server
+        $savedUser = $savedConfig.Username
 
         Write-Host ""
-        Write-Host "  Enter credentials for $($script:adServer):" -ForegroundColor Cyan
-
-        $usernamePrompt = "  Username (DOMAIN\user or user@domain.com)"
-        if ($savedUsername) {
-            $usernamePrompt += " [$savedUsername]"
-        }
-
-        $adUsername = Read-Host $usernamePrompt
-
-        if ([string]::IsNullOrWhiteSpace($adUsername)) {
-            if ($savedUsername) {
-                $adUsername = $savedUsername
-                Write-Host "  Using saved username: $savedUsername" -ForegroundColor DarkGray
-            }
-            else {
-                Write-Host "  No username entered. AD actions will be unavailable." -ForegroundColor Red
-                $script:adServer = $null
-                return $false
-            }
-        }
-
-        $adPassword = Read-Host "  Password" -AsSecureString
-
-        $script:adCredential = New-Object System.Management.Automation.PSCredential ($adUsername, $adPassword)
-
+        Write-Host "  Using saved DC: $dcInput" -ForegroundColor White
+        Write-Host "  Enter password for $savedUser" -ForegroundColor White
         Write-Host ""
-        Write-Host "  Testing connectivity to $($script:adServer)..." -ForegroundColor Cyan -NoNewline
 
         try {
-            $adDomain = Get-ADDomain -Server $script:adServer -Credential $script:adCredential -ErrorAction Stop
-            Write-Host " OK" -ForegroundColor Green
-            Write-Host "  Connected to Active Directory domain: $($adDomain.DNSRoot)" -ForegroundColor Green
-
-            # Save domain and username to config for next time (never passwords)
-            Save-Config @{
-                ADDomain   = $script:adServer
-                ADUsername  = $adUsername
-            }
-
-            return $true
+            $adCred = Get-Credential -UserName $savedUser -Message "Active Directory credentials for $dcInput"
         }
         catch {
-            Write-Host " FAILED" -ForegroundColor Red
-
-            $errMsg = "$_"
-            if ($errMsg -match 'logon failure|password|credential|access denied|authentication' ) {
-                Write-Host "  Authentication failed. Check your username and password." -ForegroundColor Red
-            }
-            elseif ($errMsg -match 'server is not operational|cannot contact|unable to connect') {
-                Write-Host "  Cannot reach domain controller '$($script:adServer)'." -ForegroundColor Red
-                Write-Host "  Verify the FQDN and ensure you have network connectivity." -ForegroundColor Yellow
-            }
-            else {
-                Write-Host "  Error: $errMsg" -ForegroundColor Red
-            }
-
-            $script:adServer     = $null
-            $script:adCredential = $null
+            Write-Host "  Credential prompt cancelled. Skipping AD." -ForegroundColor Yellow
             return $false
         }
+
+        if (-not $adCred) {
+            Write-Host "  No credentials provided. Skipping AD." -ForegroundColor Yellow
+            return $false
+        }
+
+        Write-Host "  Testing connection to $dcInput..." -ForegroundColor Cyan
+        try {
+            $domain = (Get-ADDomain -Server $dcInput -Credential $adCred -ErrorAction Stop).DNSRoot
+        }
+        catch {
+            Write-Error "Cannot connect to Active Directory via $dcInput : $_"
+            Write-Host "  Saved settings may be outdated. Try option [2] to enter new details." -ForegroundColor Yellow
+            return $false
+        }
+
+        # Inject defaults and return
+        foreach ($cmd in $adCmdlets) {
+            $PSDefaultParameterValues["${cmd}:Server"]     = $dcInput
+            $PSDefaultParameterValues["${cmd}:Credential"] = $adCred
+        }
+
+        Write-Host "Connected to Active Directory domain: $domain  (via $dcInput)" -ForegroundColor Green
+        return $true
     }
-}
 
-function Get-ADConnectionParams {
-    <#
-    .SYNOPSIS
-        Returns a hashtable suitable for splatting into AD cmdlets.
-        Includes -Server and/or -Credential only when script-scoped
-        values have been set by Connect-ToAD (i.e. non-domain-joined scenarios).
+    # -- Route: skip AD --------------------------------------------------------
+    $skipOption = if ($savedConfig) { "3" } else { "2" }
+    if ($adChoice -eq $skipOption -or ($adChoice -ne "1" -and $adChoice -ne "2" -and -not $savedConfig)) {
+        return $false
+    }
+    # If saved config exists and user chose "2", or no saved config and user chose "1",
+    # fall through to the new-entry flow below.
 
-        Usage:  $adParams = Get-ADConnectionParams
-                Get-ADUser @adParams -Filter "..."
-    #>
-    $params = @{}
-    if ($script:adServer)     { $params['Server']     = $script:adServer }
-    if ($script:adCredential) { $params['Credential'] = $script:adCredential }
-    return $params
+    # -- Route: new manual entry -----------------------------------------------
+    $dcInput = Read-Host "  Domain controller FQDN or IP (e.g. dc01.corp.contoso.com)"
+    if ([string]::IsNullOrWhiteSpace($dcInput)) {
+        Write-Host "  No server entered. Skipping AD." -ForegroundColor Yellow
+        return $false
+    }
+    $dcInput = $dcInput.Trim()
+
+    Write-Host ""
+    Write-Host "  Enter credentials for the target domain." -ForegroundColor White
+    Write-Host "  Use DOMAIN\\username or user@domain.com format." -ForegroundColor DarkGray
+    Write-Host ""
+
+    try {
+        $adCred = Get-Credential -Message "Active Directory credentials for $dcInput"
+    }
+    catch {
+        Write-Host "  Credential prompt cancelled. Skipping AD." -ForegroundColor Yellow
+        return $false
+    }
+
+    if (-not $adCred) {
+        Write-Host "  No credentials provided. Skipping AD." -ForegroundColor Yellow
+        return $false
+    }
+
+    # Test the connection with the supplied server + credential
+    Write-Host "  Testing connection to $dcInput..." -ForegroundColor Cyan
+    try {
+        $domain = (Get-ADDomain -Server $dcInput -Credential $adCred -ErrorAction Stop).DNSRoot
+    }
+    catch {
+        Write-Error "Cannot connect to Active Directory via $dcInput : $_"
+        return $false
+    }
+
+    # -- Success: inject -Server and -Credential into every AD cmdlet ----------
+    foreach ($cmd in $adCmdlets) {
+        $PSDefaultParameterValues["${cmd}:Server"]     = $dcInput
+        $PSDefaultParameterValues["${cmd}:Credential"] = $adCred
+    }
+
+    # -- Save settings to JSON (no password -- only username) ------------------
+    try {
+        $configToSave = @{
+            Server   = $dcInput
+            Domain   = $domain
+            Username = $adCred.UserName
+            SavedAt  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        }
+        $configToSave | ConvertTo-Json | Set-Content -Path $adConfigPath -Encoding UTF8 -Force
+        Write-Host "  AD connection settings saved to: $adConfigPath" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "  Could not save AD connection settings: $_" -ForegroundColor DarkGray
+    }
+
+    Write-Host "Connected to Active Directory domain: $domain  (via $dcInput)" -ForegroundColor Green
+    return $true
 }
 
 function Connect-ToMDE {
@@ -1100,9 +764,6 @@ function New-MDEAppRegistration {
                 "User.ReadWrite.All",
                 "Directory.ReadWrite.All",
                 "Device.Read.All",
-                "DeviceManagementManagedDevices.Read.All",
-                "DeviceManagementManagedDevices.PrivilegedOperations.All",
-                "AuditLog.Read.All",
                 "Application.ReadWrite.All",
                 "DelegatedPermissionGrant.ReadWrite.All"
             )
@@ -1113,7 +774,7 @@ function New-MDEAppRegistration {
             Write-Warning "Failed to reconnect Graph with additional scopes: $_"
             Write-Host "  Attempting to reconnect with original scopes..." -ForegroundColor Yellow
             try {
-                Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.ReadWrite.All", "Device.Read.All", "DeviceManagementManagedDevices.Read.All", "DeviceManagementManagedDevices.PrivilegedOperations.All", "AuditLog.Read.All" -ErrorAction Stop
+                Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.ReadWrite.All", "Device.Read.All" -ErrorAction Stop
             } catch {}
             return $null
         }
@@ -1879,639 +1540,13 @@ function Get-MDEMachineByAADDeviceId {
 
     if (-not $AADDeviceId) { return $null }
 
-    $result = Invoke-MDERequest -Method GET -Endpoint "/api/machines?`$filter=aadDeviceId eq $AADDeviceId"
+    $result = Invoke-MDERequest -Method GET -Endpoint "/api/machines?`$filter=aadDeviceId eq '$AADDeviceId'"
 
     if ($result -and $result.value -and $result.value.Count -gt 0) {
         return $result.value[0]
     }
 
     return $null
-}
-
-# ==============================================================================
-# FUNCTIONS -- INTUNE (via Microsoft Graph)
-# ==============================================================================
-
-function Get-IntuneManagedDevice {
-    <#
-    .SYNOPSIS
-        Looks up an Intune managed device by its Entra (AAD) device ID.
-        Returns the managed device object, or $null if not found / not enrolled.
-    #>
-    param([string]$AADDeviceId)
-
-    if (-not $AADDeviceId) { return $null }
-
-    try {
-        $result = Invoke-MgGraphRequest -Method GET `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=azureADDeviceId eq '$AADDeviceId'" `
-            -ErrorAction Stop
-
-        if ($result.value -and $result.value.Count -gt 0) {
-            return $result.value[0]
-        }
-    }
-    catch {
-        # 403 = tenant may not have Intune licence or user lacks role
-        $statusCode = $null
-        try { $statusCode = $_.Exception.Response.StatusCode.value__ } catch {}
-
-        if ($statusCode -eq 403) {
-            Write-Host "  Intune query denied (HTTP 403). You may need an Intune Administrator role." -ForegroundColor DarkGray
-        }
-        elseif ($statusCode -ne 404) {
-            Write-Host "  Could not query Intune: $_" -ForegroundColor DarkGray
-        }
-    }
-
-    return $null
-}
-
-function Show-EntraDeviceDetail {
-    <#
-    .SYNOPSIS
-        Displays Entra device properties for a device object that was already
-        fetched by Show-UserDevices / Get-MgDevice. Useful as a fallback when
-        MDE is not available.
-    #>
-    param($Device)
-
-    if (-not $Device) { return }
-
-    Write-Host ""
-    Write-Host "  -- Entra Device Detail --" -ForegroundColor Cyan
-
-    $dName    = if ($Device.DisplayName)            { $Device.DisplayName }            else { "--" }
-    $dOS      = if ($Device.OperatingSystem)         { $Device.OperatingSystem }         else { "--" }
-    $dOSVer   = if ($Device.OperatingSystemVersion)  { $Device.OperatingSystemVersion }  else { "" }
-    $dMfr     = if ($Device.Manufacturer)            { $Device.Manufacturer }            else { "" }
-    $dModel   = if ($Device.Model)                   { $Device.Model }                   else { "" }
-    $dHardware = if ($dMfr -or $dModel) { "$dMfr $dModel".Trim() } else { "--" }
-    $dTrust   = if ($Device.TrustType)               { $Device.TrustType }               else { "--" }
-    $dProfile = if ($Device.ProfileType)             { $Device.ProfileType }             else { "" }
-
-    $complianceText   = switch ($Device.IsCompliant)    { $true { "Compliant" } $false { "Non-Compliant" } default { "Unknown" } }
-    $complianceColour = switch ($Device.IsCompliant)    { $true { "Green" }     $false { "Red" }           default { "DarkGray" } }
-    $managedText      = switch ($Device.IsManaged)      { $true { "Managed" }   $false { "Unmanaged" }     default { "Unknown" } }
-    $managedColour    = switch ($Device.IsManaged)      { $true { "Green" }     $false { "Yellow" }        default { "DarkGray" } }
-    $enabledText      = switch ($Device.AccountEnabled) { $true { "Enabled" }   $false { "Disabled" }      default { "--" } }
-    $enabledColour    = switch ($Device.AccountEnabled) { $true { "Green" }     $false { "Red" }           default { "DarkGray" } }
-
-    $dRegistered = if ($Device.RegistrationDateTime)          { $Device.RegistrationDateTime.ToString("yyyy-MM-dd HH:mm") }          else { "--" }
-    $dLastSignIn = if ($Device.ApproximateLastSignInDateTime)  { $Device.ApproximateLastSignInDateTime.ToString("yyyy-MM-dd HH:mm") } else { "--" }
-
-    Write-Host "  Display Name   : $dName" -ForegroundColor White
-    Write-Host "  OS             : $dOS $dOSVer" -ForegroundColor White
-    Write-Host "  Hardware       : $dHardware" -ForegroundColor White
-    Write-Host "  Trust Type     : $dTrust" -ForegroundColor $(switch ($dTrust) { "AzureAd" { "Cyan" } "ServerAd" { "DarkCyan" } "Workplace" { "DarkYellow" } default { "White" } })
-    if ($dProfile) {
-        Write-Host "  Profile Type   : $dProfile" -ForegroundColor White
-    }
-    Write-Host "  Status         : " -ForegroundColor White -NoNewline
-    Write-Host $enabledText -ForegroundColor $enabledColour -NoNewline
-    Write-Host " | " -NoNewline
-    Write-Host $complianceText -ForegroundColor $complianceColour -NoNewline
-    Write-Host " | " -NoNewline
-    Write-Host $managedText -ForegroundColor $managedColour
-    Write-Host "  Registered     : $dRegistered" -ForegroundColor White
-    Write-Host "  Last Sign-In   : $dLastSignIn" -ForegroundColor White
-    Write-Host "  Device ID      : $($Device.DeviceId)" -ForegroundColor DarkGray
-}
-
-function Show-IntuneDeviceDetail {
-    <#
-    .SYNOPSIS
-        Displays Intune managed device properties.
-    #>
-    param($ManagedDevice)
-
-    if (-not $ManagedDevice) { return }
-
-    Write-Host ""
-    Write-Host "  -- Intune Managed Device Detail --" -ForegroundColor Magenta
-
-    $iName     = if ($ManagedDevice.deviceName)              { $ManagedDevice.deviceName }              else { "--" }
-    $iOS       = if ($ManagedDevice.operatingSystem)         { $ManagedDevice.operatingSystem }         else { "--" }
-    $iOSVer    = if ($ManagedDevice.osVersion)               { $ManagedDevice.osVersion }               else { "" }
-    $iSerial   = if ($ManagedDevice.serialNumber)            { $ManagedDevice.serialNumber }            else { "--" }
-    $iMfr      = if ($ManagedDevice.manufacturer)            { $ManagedDevice.manufacturer }            else { "" }
-    $iModel    = if ($ManagedDevice.model)                   { $ManagedDevice.model }                   else { "" }
-    $iHardware = if ($iMfr -or $iModel) { "$iMfr $iModel".Trim() } else { "--" }
-    $iOwner    = if ($ManagedDevice.managedDeviceOwnerType)  { $ManagedDevice.managedDeviceOwnerType }  else { "--" }
-    $iEnrolled = if ($ManagedDevice.enrolledDateTime)        { $ManagedDevice.enrolledDateTime }        else { "--" }
-    $iLastSync = if ($ManagedDevice.lastSyncDateTime)        { $ManagedDevice.lastSyncDateTime }        else { "--" }
-    $iUPN      = if ($ManagedDevice.userPrincipalName)       { $ManagedDevice.userPrincipalName }       else { "--" }
-    $iMgmtAgent = if ($ManagedDevice.managementAgent)        { $ManagedDevice.managementAgent }         else { "--" }
-    $iCategory  = if ($ManagedDevice.deviceCategoryDisplayName) { $ManagedDevice.deviceCategoryDisplayName } else { "--" }
-
-    # Compliance state
-    $compState = if ($ManagedDevice.complianceState) { $ManagedDevice.complianceState } else { "unknown" }
-    $compColour = switch ($compState) {
-        "compliant"    { "Green" }
-        "noncompliant" { "Red" }
-        "conflict"     { "Yellow" }
-        "error"        { "Red" }
-        "inGracePeriod" { "Yellow" }
-        "configManager" { "Cyan" }
-        default        { "DarkGray" }
-    }
-
-    # Management state
-    $mgmtState = if ($ManagedDevice.managementState) { $ManagedDevice.managementState } else { "--" }
-    $mgmtColour = switch ($mgmtState) {
-        "managed"       { "Green" }
-        "retirePending" { "Yellow" }
-        "wipePending"   { "Red" }
-        default         { "White" }
-    }
-
-    # Encryption
-    $encrypted = if ($null -ne $ManagedDevice.isEncrypted) {
-        if ($ManagedDevice.isEncrypted) { "Yes" } else { "No" }
-    } else { "--" }
-    $encColour = switch ($encrypted) { "Yes" { "Green" } "No" { "Red" } default { "DarkGray" } }
-
-    # Supervised
-    $supervised = if ($null -ne $ManagedDevice.isSupervised) {
-        if ($ManagedDevice.isSupervised) { "Yes" } else { "No" }
-    } else { "--" }
-
-    Write-Host "  Device Name    : $iName" -ForegroundColor White
-    Write-Host "  OS             : $iOS $iOSVer" -ForegroundColor White
-    Write-Host "  Hardware       : $iHardware" -ForegroundColor White
-    Write-Host "  Serial Number  : $iSerial" -ForegroundColor White
-    Write-Host "  Ownership      : $iOwner" -ForegroundColor $(if ($iOwner -eq 'company') { "Cyan" } else { "White" })
-    Write-Host "  Mgmt Agent     : $iMgmtAgent" -ForegroundColor White
-    Write-Host "  Mgmt State     : $mgmtState" -ForegroundColor $mgmtColour
-    Write-Host "  Compliance     : $compState" -ForegroundColor $compColour
-    Write-Host "  Encrypted      : $encrypted" -ForegroundColor $encColour
-    Write-Host "  Supervised     : $supervised" -ForegroundColor White
-    Write-Host "  Category       : $iCategory" -ForegroundColor White
-    Write-Host "  Primary User   : $iUPN" -ForegroundColor White
-    Write-Host "  Enrolled       : $iEnrolled" -ForegroundColor White
-    Write-Host "  Last Sync      : $iLastSync" -ForegroundColor White
-    Write-Host "  Intune ID      : $($ManagedDevice.id)" -ForegroundColor DarkGray
-}
-
-function Get-IntuneAvailableActions {
-    <#
-    .SYNOPSIS
-        Returns an ordered list of Intune actions available for a managed device
-        based on its operating system, ownership type, and supervised state.
-
-        Device categories and their available actions:
-          Corporate Windows  : Sync, Restart, Defender Quick Scan, Defender Full Scan, Fresh Start, Retire, Wipe
-          Personal Windows   : Sync, Restart, Retire
-          Corporate iOS      : Sync, Remote Lock, Restart, Retire, Wipe  (+Lost Mode if supervised)
-          Corporate Android  : Sync, Remote Lock, Restart, Retire, Wipe
-          Personal iOS/Android : Sync, Remote Lock, Retire
-          Corporate macOS    : Sync, Restart, Remote Lock, Retire, Wipe
-          Personal macOS     : Sync, Retire
-
-        Returns: Array of hashtables with keys: Label, ActionKey, Colour
-    #>
-    param($ManagedDevice)
-
-    if (-not $ManagedDevice) { return @() }
-
-    $os         = if ($ManagedDevice.operatingSystem) { $ManagedDevice.operatingSystem } else { "" }
-    $ownership  = if ($ManagedDevice.managedDeviceOwnerType) { $ManagedDevice.managedDeviceOwnerType } else { "unknown" }
-    $supervised = if ($null -ne $ManagedDevice.isSupervised) { $ManagedDevice.isSupervised } else { $false }
-
-    $isCorporate = ($ownership -eq "company")
-    $isWinOS   = ($os -match '^Windows')
-    $isIOS       = ($os -match '^iOS|^iPadOS')
-    $isAndroid   = ($os -match '^Android')
-    $isMacPlatform     = ($os -match '^macOS|^Mac OS')
-    $isMobile    = ($isIOS -or $isAndroid)
-
-    $actions = [System.Collections.Generic.List[hashtable]]::new()
-
-    # -- Sync is always available --
-    $actions.Add(@{ Label = "Sync device";                ActionKey = "intune_sync";             Colour = "White" })
-
-    # -- Restart: all corporate; personal Windows only --
-    if ($isCorporate -or $isWinOS) {
-        $actions.Add(@{ Label = "Restart device";         ActionKey = "intune_restart";           Colour = "White" })
-    }
-
-    # -- Remote Lock: mobile devices (all), corporate macOS --
-    if ($isMobile -or ($isMacPlatform -and $isCorporate)) {
-        $actions.Add(@{ Label = "Remote Lock";            ActionKey = "intune_lock";              Colour = "White" })
-    }
-
-    # -- Windows Defender Scan: Windows only, any ownership --
-    if ($isWinOS) {
-        $actions.Add(@{ Label = "Defender Scan (Quick)";  ActionKey = "intune_defender_quick";    Colour = "White" })
-        $actions.Add(@{ Label = "Defender Scan (Full)";   ActionKey = "intune_defender_full";     Colour = "White" })
-    }
-
-    # -- Fresh Start: corporate Windows only --
-    if ($isWinOS -and $isCorporate) {
-        $actions.Add(@{ Label = "Fresh Start";            ActionKey = "intune_freshstart";        Colour = "Yellow" })
-    }
-
-    # -- Lost Mode: supervised iOS only, corporate --
-    if ($isIOS -and $isCorporate -and $supervised) {
-        $actions.Add(@{ Label = "Enable Lost Mode";       ActionKey = "intune_lostmode_on";       Colour = "Yellow" })
-        $actions.Add(@{ Label = "Disable Lost Mode";      ActionKey = "intune_lostmode_off";      Colour = "White" })
-    }
-
-    # -- Retire is always available --
-    $actions.Add(@{     Label = "Retire device";          ActionKey = "intune_retire";            Colour = "Yellow" })
-
-    # -- Wipe: corporate only --
-    if ($isCorporate) {
-        $actions.Add(@{ Label = "Wipe device";            ActionKey = "intune_wipe";              Colour = "Red" })
-    }
-
-    return @($actions)
-}
-
-function Invoke-IntuneSyncDevice {
-    <#
-    .SYNOPSIS
-        Triggers an Intune policy sync on a managed device.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  SYNC DEVICE (Intune)" -ForegroundColor Cyan
-    Write-Host "  This will trigger an immediate policy and configuration sync." -ForegroundColor White
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-
-    $confirm = Read-Host "  Proceed? (Y/N)"
-    if ($confirm -ne "Y" -and $confirm -ne "y") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Sending sync request..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/syncDevice" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  The device will sync on its next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneRestartDevice {
-    <#
-    .SYNOPSIS
-        Sends a remote restart command to an Intune managed device.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  RESTART DEVICE (Intune)" -ForegroundColor Yellow
-    Write-Host "  This will remotely restart the device." -ForegroundColor White
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  WARNING: Unsaved work on the device will be lost." -ForegroundColor Red
-
-    $confirm = Read-Host "  Proceed? (Y/N)"
-    if ($confirm -ne "Y" -and $confirm -ne "y") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Sending restart command..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/rebootNow" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  The device will restart shortly." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneRemoteLock {
-    <#
-    .SYNOPSIS
-        Sends a remote lock command to an Intune managed device.
-        Primarily used for mobile devices and macOS.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  REMOTE LOCK (Intune)" -ForegroundColor Yellow
-    Write-Host "  This will immediately lock the device screen." -ForegroundColor White
-    Write-Host "  The user will need to unlock with their PIN/password/biometrics." -ForegroundColor White
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-
-    $confirm = Read-Host "  Proceed? (Y/N)"
-    if ($confirm -ne "Y" -and $confirm -ne "y") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Sending remote lock command..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/remoteLock" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  The device will lock on its next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneDefenderScan {
-    <#
-    .SYNOPSIS
-        Triggers a Windows Defender scan on a managed Windows device.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName,
-        [Parameter(Mandatory)][bool]$QuickScan
-    )
-
-    $scanType = if ($QuickScan) { "Quick" } else { "Full" }
-
-    Write-Host ""
-    Write-Host "  WINDOWS DEFENDER SCAN - $scanType (Intune)" -ForegroundColor Cyan
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    if (-not $QuickScan) {
-        Write-Host "  A full scan may take a long time and can impact" -ForegroundColor Yellow
-        Write-Host "  device performance during the scan." -ForegroundColor Yellow
-    }
-    Write-Host ""
-
-    $confirm = Read-Host "  Proceed? (Y/N)"
-    if ($confirm -ne "Y" -and $confirm -ne "y") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Triggering $scanType scan..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        $body = @{ quickScan = $QuickScan } | ConvertTo-Json
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/windowsDefenderScan" `
-            -Body $body -ContentType "application/json" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  $scanType scan will start on the device's next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneFreshStart {
-    <#
-    .SYNOPSIS
-        Triggers a Fresh Start on a corporate-owned Windows device.
-        This reinstalls Windows, optionally keeping user data, and
-        removes all pre-installed (OEM) apps.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  FRESH START (Intune)" -ForegroundColor Yellow
-    Write-Host "  This will reinstall Windows and remove all OEM/pre-installed apps." -ForegroundColor White
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  WARNING: All installed applications will be removed." -ForegroundColor Red
-    Write-Host "  The device will need to re-download apps from Intune." -ForegroundColor Yellow
-    Write-Host ""
-
-    Write-Host "  Keep user data (files in user profile)?" -ForegroundColor Cyan
-    $keepData = Read-Host "  (Y = keep user data / N = remove everything)"
-    $keepUserData = ($keepData -eq "Y" -or $keepData -eq "y")
-
-    $keepLabel = if ($keepUserData) { "Yes - user files will be preserved" } else { "No - all data will be removed" }
-    Write-Host ""
-    Write-Host "  Keep user data: $keepLabel" -ForegroundColor $(if ($keepUserData) { "Green" } else { "Red" })
-
-    $confirm = Read-Host "  Type 'FRESHSTART' to confirm (or anything else to cancel)"
-    if ($confirm -ne "FRESHSTART") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Sending Fresh Start command..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        $body = @{ keepUserData = $keepUserData } | ConvertTo-Json
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/cleanWindowsDevice" `
-            -Body $body -ContentType "application/json" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  Fresh Start will begin on the device's next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneEnableLostMode {
-    <#
-    .SYNOPSIS
-        Enables Lost Mode on a supervised iOS device.
-        Locks the device and displays a custom message and phone number.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  ENABLE LOST MODE (Intune)" -ForegroundColor Yellow
-    Write-Host "  This will lock the device and display a message on screen." -ForegroundColor White
-    Write-Host "  Only available for supervised iOS devices." -ForegroundColor White
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-
-    $lostMessage = Read-Host "  Message to display on device (e.g. 'This device has been lost')"
-    if ([string]::IsNullOrWhiteSpace($lostMessage)) {
-        $lostMessage = "This device has been lost. Please contact the IT department."
-    }
-
-    $lostPhone = Read-Host "  Phone number to display (optional, press Enter to skip)"
-    $lostFooter = Read-Host "  Footer text (optional, press Enter to skip)"
-
-    Write-Host ""
-    $confirm = Read-Host "  Enable Lost Mode? (Y/N)"
-    if ($confirm -ne "Y" -and $confirm -ne "y") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Enabling Lost Mode..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        $body = @{ message = $lostMessage }
-        if (-not [string]::IsNullOrWhiteSpace($lostPhone))  { $body["phoneNumber"] = $lostPhone }
-        if (-not [string]::IsNullOrWhiteSpace($lostFooter)) { $body["footer"]      = $lostFooter }
-
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/enableLostMode" `
-            -Body ($body | ConvertTo-Json) -ContentType "application/json" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  Lost Mode will activate on the device's next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneDisableLostMode {
-    <#
-    .SYNOPSIS
-        Disables Lost Mode on a supervised iOS device.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  DISABLE LOST MODE (Intune)" -ForegroundColor Cyan
-    Write-Host "  This will turn off Lost Mode and return the device to normal." -ForegroundColor White
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-
-    $confirm = Read-Host "  Proceed? (Y/N)"
-    if ($confirm -ne "Y" -and $confirm -ne "y") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Disabling Lost Mode..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/disableLostMode" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  Lost Mode will be disabled on the device's next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneRetireDevice {
-    <#
-    .SYNOPSIS
-        Sends a retire command to an Intune managed device.
-        Retire removes company data but leaves personal data intact.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  RETIRE DEVICE (Intune)" -ForegroundColor Red
-    Write-Host "  This will REMOVE all company data, apps, and profiles" -ForegroundColor White
-    Write-Host "  from the device. Personal data will remain." -ForegroundColor White
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  WARNING: This action cannot be easily undone." -ForegroundColor Red
-    Write-Host "  The device will need to be re-enrolled to restore" -ForegroundColor Red
-    Write-Host "  company access." -ForegroundColor Red
-    Write-Host ""
-
-    $confirm = Read-Host "  Type 'RETIRE' to confirm (or anything else to cancel)"
-    if ($confirm -ne "RETIRE") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Sending retire command..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/retire" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  The device will be retired on its next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
-}
-
-function Invoke-IntuneWipeDevice {
-    <#
-    .SYNOPSIS
-        Sends a full wipe command to an Intune managed device.
-        This factory-resets the device, removing ALL data.
-        Only available for corporate-owned devices.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IntuneDeviceId,
-        [string]$DeviceName
-    )
-
-    Write-Host ""
-    Write-Host "  !!  WIPE DEVICE (Intune)  !!" -ForegroundColor Red
-    Write-Host "  This will FACTORY RESET the device, removing ALL data" -ForegroundColor Red
-    Write-Host "  including personal files, apps, and settings." -ForegroundColor Red
-    Write-Host "  Device: $DeviceName" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  THIS ACTION IS DESTRUCTIVE AND IRREVERSIBLE." -ForegroundColor Red
-    Write-Host ""
-
-    $confirm = Read-Host "  Type 'WIPE' to confirm (or anything else to cancel)"
-    if ($confirm -ne "WIPE") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-Host "  Sending wipe command..." -ForegroundColor Cyan -NoNewline
-
-    try {
-        Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$IntuneDeviceId/wipe" `
-            -ErrorAction Stop | Out-Null
-        Write-Host " Done" -ForegroundColor Green
-        Write-Host "  The device will be wiped on its next check-in." -ForegroundColor Yellow
-    }
-    catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Warning "  Error: $_"
-    }
 }
 
 # ==============================================================================
@@ -2560,82 +1595,6 @@ function Show-UserDetail {
         Write-Host "  No risk record found for this user." -ForegroundColor DarkGray
     }
 
-    # -- Recent sign-ins (last 30 days, top 5) ---------------------------------
-    Write-Host ""
-    Write-Host "  -- Recent Sign-Ins (last 30 days) --" -ForegroundColor Cyan
-
-    try {
-        $signInCutoff = (Get-Date).AddDays(-30).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $signInFilter = "userId eq '$userId' and createdDateTime ge $signInCutoff"
-        $signInUri    = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$signInFilter&`$top=5&`$orderby=createdDateTime desc"
-
-        $signInResult = Invoke-MgGraphRequest -Method GET -Uri $signInUri -ErrorAction Stop
-
-        if ($signInResult.value -and $signInResult.value.Count -gt 0) {
-            foreach ($si in $signInResult.value) {
-                $siTime   = if ($si.createdDateTime) {
-                    ([datetime]$si.createdDateTime).ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-                } else { "--" }
-                $siApp    = if ($si.appDisplayName)      { $si.appDisplayName }      else { "--" }
-                $siStatus = if ($si.status -and $si.status.errorCode -eq 0) { "Success" }
-                            elseif ($si.status) { "Failed ($($si.status.errorCode))" }
-                            else { "--" }
-                $siStatusColour = if ($siStatus -eq "Success") { "Green" } else { "Red" }
-                $siIP     = if ($si.ipAddress)            { $si.ipAddress }            else { "--" }
-                $siLoc    = "--"
-                if ($si.location) {
-                    $locParts = @()
-                    if ($si.location.city)           { $locParts += $si.location.city }
-                    if ($si.location.countryOrRegion) { $locParts += $si.location.countryOrRegion }
-                    if ($locParts.Count -gt 0)       { $siLoc = $locParts -join ', ' }
-                }
-                $siDevice = "--"
-                if ($si.deviceDetail) {
-                    $devParts = @()
-                    if ($si.deviceDetail.displayName)     { $devParts += $si.deviceDetail.displayName }
-                    if ($si.deviceDetail.operatingSystem)  { $devParts += $si.deviceDetail.operatingSystem }
-                    if ($si.deviceDetail.browser)          { $devParts += $si.deviceDetail.browser }
-                    if ($devParts.Count -gt 0)            { $siDevice = $devParts -join ' / ' }
-                }
-                $siCA = "--"
-                if ($si.conditionalAccessStatus) {
-                    $siCA = switch ($si.conditionalAccessStatus) {
-                        "success"      { "Applied" }
-                        "failure"      { "BLOCKED" }
-                        "notApplied"   { "Not Applied" }
-                        default        { $si.conditionalAccessStatus }
-                    }
-                }
-                $siCAColour = switch ($siCA) {
-                    "Applied"     { "Green" }
-                    "BLOCKED"     { "Red" }
-                    "Not Applied" { "DarkGray" }
-                    default       { "White" }
-                }
-
-                Write-Host "    $siTime  " -ForegroundColor White -NoNewline
-                Write-Host $siStatus.PadRight(16) -ForegroundColor $siStatusColour -NoNewline
-                Write-Host $siApp -ForegroundColor White
-                Write-Host "                   IP: $siIP  Location: $siLoc" -ForegroundColor DarkGray
-                Write-Host "                   Device: $siDevice" -ForegroundColor DarkGray
-                Write-Host "                   CA Policy: " -ForegroundColor DarkGray -NoNewline
-                Write-Host $siCA -ForegroundColor $siCAColour
-            }
-        }
-        else {
-            Write-Host "  No sign-ins found in the last 30 days." -ForegroundColor DarkGray
-        }
-    }
-    catch {
-        $siErrMsg = "$_"
-        if ($siErrMsg -match '403|Forbidden|Authorization') {
-            Write-Host "  Sign-in logs require AuditLog.Read.All permission or an Entra ID P1/P2 licence." -ForegroundColor DarkGray
-        }
-        else {
-            Write-Host "  Could not retrieve sign-in logs: $_" -ForegroundColor DarkGray
-        }
-    }
-
     # -- Active Directory info -------------------------------------------------
     Write-Host ""
     Write-Host "  -- Active Directory --" -ForegroundColor Cyan
@@ -2643,17 +1602,16 @@ function Show-UserDetail {
     $samAccount = ($upn -split '@')[0]
 
     try {
-        $adParams = Get-ADConnectionParams
-        $domainDN = (Get-ADDomain @adParams -ErrorAction Stop).DistinguishedName
+        $domainDN = (Get-ADDomain -ErrorAction Stop).DistinguishedName
 
-        $adUser = Get-ADUser @adParams -Filter "SamAccountName -eq '$samAccount'" `
+        $adUser = Get-ADUser -Filter "SamAccountName -eq '$samAccount'" `
             -SearchBase $domainDN -SearchScope Subtree -Properties `
             Enabled, LockedOut, PasswordLastSet, PasswordExpired, `
             PasswordNeverExpires, LastLogonDate, LastBadPasswordAttempt, `
             BadPwdCount, Description, whenCreated, MemberOf -ErrorAction Stop
 
         if (-not $adUser) {
-            $adUser = Get-ADUser @adParams -Filter "UserPrincipalName -eq '$upn'" `
+            $adUser = Get-ADUser -Filter "UserPrincipalName -eq '$upn'" `
                 -SearchBase $domainDN -SearchScope Subtree -Properties `
                 Enabled, LockedOut, PasswordLastSet, PasswordExpired, `
                 PasswordNeverExpires, LastLogonDate, LastBadPasswordAttempt, `
@@ -2846,191 +1804,6 @@ function Show-UserDevices {
     return $deviceList
 }
 
-function Show-DeviceNetworkLocation {
-    <#
-    .SYNOPSIS
-        Displays the last known public IP addresses and locations for a device.
-        Sources:
-          - MDE: lastIpAddress / lastExternalIpAddress (if MDE machine provided)
-          - Sign-in logs: last 5 unique IP/location combinations seen from
-            this device in the last 30 days (requires AuditLog.Read.All + P1/P2).
-        Falls back gracefully when data is unavailable.
-    #>
-    param(
-        $EntraDevice,     # For matching by device ID in sign-in logs
-        $IntuneDevice,    # For UPN and device name fallback
-        $MDEMachine,      # For MDE-reported IPs
-        $User             # For scoping sign-in log query
-    )
-
-    Write-Host ""
-    Write-Host "  -- Network / Location --" -ForegroundColor Cyan
-
-    $hasAnyData = $false
-
-    # -- MDE-reported IPs (quick, no extra API call) ----------------------------
-    if ($MDEMachine) {
-        $mdeIntIP  = if ($MDEMachine.lastIpAddress)        { $MDEMachine.lastIpAddress }        else { $null }
-        $mdeExtIP  = if ($MDEMachine.lastExternalIpAddress) { $MDEMachine.lastExternalIpAddress } else { $null }
-        $mdeLastSeen = if ($MDEMachine.lastSeen)           { $MDEMachine.lastSeen }              else { $null }
-
-        if ($mdeIntIP -or $mdeExtIP) {
-            $hasAnyData = $true
-            Write-Host "  MDE Reported:" -ForegroundColor DarkCyan
-            if ($mdeIntIP)  { Write-Host "    Internal IP  : $mdeIntIP" -ForegroundColor White }
-            if ($mdeExtIP)  { Write-Host "    External IP  : $mdeExtIP" -ForegroundColor White }
-            if ($mdeLastSeen) { Write-Host "    As of        : $mdeLastSeen" -ForegroundColor DarkGray }
-        }
-    }
-
-    # -- Sign-in log lookup for device IP / location ----------------------------
-    # Determine user ID to scope the sign-in query
-    $queryUserId = $null
-    if ($User -and $User.Id) {
-        $queryUserId = $User.Id
-    }
-    elseif ($IntuneDevice -and $IntuneDevice.userId) {
-        $queryUserId = $IntuneDevice.userId
-    }
-    elseif ($IntuneDevice -and $IntuneDevice.userPrincipalName) {
-        # Look up user ID from UPN
-        try {
-            $upnLookup = Invoke-MgGraphRequest -Method GET `
-                -Uri "https://graph.microsoft.com/v1.0/users/$($IntuneDevice.userPrincipalName)?`$select=id" `
-                -ErrorAction Stop
-            if ($upnLookup -and $upnLookup.id) { $queryUserId = $upnLookup.id }
-        }
-        catch { }
-    }
-    elseif ($EntraDevice -and $EntraDevice.Id) {
-        # Try registered owner
-        try {
-            $regOwners = Invoke-MgGraphRequest -Method GET `
-                -Uri "https://graph.microsoft.com/v1.0/devices/$($EntraDevice.Id)/registeredOwners?`$select=id" `
-                -ErrorAction Stop
-            if ($regOwners.value -and $regOwners.value.Count -gt 0) {
-                $queryUserId = $regOwners.value[0].id
-            }
-        }
-        catch { }
-    }
-
-    if (-not $queryUserId) {
-        if (-not $hasAnyData) {
-            Write-Host "  Could not determine device owner -- unable to query sign-in logs." -ForegroundColor DarkGray
-        }
-        return
-    }
-
-    # Build device name to match against sign-in deviceDetail
-    $matchDeviceName = $null
-    $matchDeviceId   = $null
-
-    if ($EntraDevice -and $EntraDevice.DeviceId)   { $matchDeviceId   = $EntraDevice.DeviceId }
-    if ($EntraDevice -and $EntraDevice.DisplayName) { $matchDeviceName = $EntraDevice.DisplayName }
-    elseif ($IntuneDevice -and $IntuneDevice.deviceName) { $matchDeviceName = $IntuneDevice.deviceName }
-
-    try {
-        $siCutoff = (Get-Date).AddDays(-30).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $siFilter = "userId eq '$queryUserId' and createdDateTime ge $siCutoff"
-        $siUri    = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=$siFilter&`$top=50&`$orderby=createdDateTime desc&`$select=createdDateTime,ipAddress,location,deviceDetail,status,appDisplayName"
-
-        $siResult = Invoke-MgGraphRequest -Method GET -Uri $siUri -ErrorAction Stop
-
-        if ($siResult.value -and $siResult.value.Count -gt 0) {
-            # Filter for sign-ins from THIS device
-            $deviceSignIns = @()
-            foreach ($entry in $siResult.value) {
-                $devDetail = $entry.deviceDetail
-                if (-not $devDetail) { continue }
-
-                $isMatch = $false
-                # Match by device ID (most reliable)
-                if ($matchDeviceId -and $devDetail.deviceId -and ($devDetail.deviceId -eq $matchDeviceId)) {
-                    $isMatch = $true
-                }
-                # Match by display name (fallback)
-                elseif ($matchDeviceName -and $devDetail.displayName -and ($devDetail.displayName -eq $matchDeviceName)) {
-                    $isMatch = $true
-                }
-
-                if ($isMatch) { $deviceSignIns += $entry }
-            }
-
-            if ($deviceSignIns.Count -gt 0) {
-                $hasAnyData = $true
-
-                # Deduplicate by IP to show unique locations
-                $seenIPs  = @{}
-                $uniqueEntries = @()
-
-                foreach ($si in $deviceSignIns) {
-                    $ip = if ($si.ipAddress) { $si.ipAddress } else { "Unknown" }
-                    if (-not $seenIPs.ContainsKey($ip)) {
-                        $seenIPs[$ip] = $true
-                        $uniqueEntries += $si
-                    }
-                    if ($uniqueEntries.Count -ge 5) { break }
-                }
-
-                Write-Host "  Sign-In Log (last 30 days, $($uniqueEntries.Count) unique IP(s)):" -ForegroundColor DarkCyan
-
-                foreach ($si in $uniqueEntries) {
-                    $ipAddr = if ($si.ipAddress) { $si.ipAddress } else { "--" }
-                    $siTime = if ($si.createdDateTime) {
-                        ([datetime]$si.createdDateTime).ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-                    } else { "--" }
-
-                    $locDisplay = "--"
-                    if ($si.location) {
-                        $locParts = @()
-                        if ($si.location.city)             { $locParts += $si.location.city }
-                        if ($si.location.state)            { $locParts += $si.location.state }
-                        if ($si.location.countryOrRegion)  { $locParts += $si.location.countryOrRegion }
-                        if ($locParts.Count -gt 0)         { $locDisplay = $locParts -join ', ' }
-                    }
-
-                    $latLon = ""
-                    if ($si.location -and $si.location.geoCoordinates) {
-                        $lat = $si.location.geoCoordinates.latitude
-                        $lon = $si.location.geoCoordinates.longitude
-                        if ($null -ne $lat -and $null -ne $lon) {
-                            $latLon = " ($lat, $lon)"
-                        }
-                    }
-
-                    Write-Host "    $ipAddr" -ForegroundColor White -NoNewline
-                    Write-Host "  $locDisplay$latLon" -ForegroundColor DarkGray -NoNewline
-                    Write-Host "  (last seen $siTime)" -ForegroundColor DarkGray
-                }
-            }
-            elseif (-not $hasAnyData) {
-                Write-Host "  No sign-ins found from this device in the last 30 days." -ForegroundColor DarkGray
-            }
-        }
-        elseif (-not $hasAnyData) {
-            Write-Host "  No sign-in data available for this device." -ForegroundColor DarkGray
-        }
-    }
-    catch {
-        $netErrMsg = "$_"
-        if ($netErrMsg -match '403|Forbidden|Authorization') {
-            if (-not $hasAnyData) {
-                Write-Host "  Sign-in logs require AuditLog.Read.All and Entra ID P1/P2." -ForegroundColor DarkGray
-            }
-        }
-        else {
-            if (-not $hasAnyData) {
-                Write-Host "  Could not retrieve sign-in logs: $_" -ForegroundColor DarkGray
-            }
-        }
-    }
-
-    if (-not $hasAnyData) {
-        Write-Host "  No network/location data available." -ForegroundColor DarkGray
-    }
-}
-
 function Show-MDEDeviceDetail {
     <#
     .SYNOPSIS
@@ -3087,7 +1860,7 @@ function Show-MDEDeviceDetail {
     # -- Show recent isolation actions if any ----------------------------------
     try {
         $actionsResult = Invoke-MDERequest -Method GET `
-            -Endpoint "/api/machines/$($Machine.id)/machineactions?`$top=5&`$orderby=lastUpdateDateTimeUtc desc&`$filter=type eq 'Isolate' or type eq 'Unisolate'"
+            -Endpoint "/api/machineactions?`$filter=machineId eq '$($Machine.id)' and (type eq 'Isolate' or type eq 'Unisolate')&`$top=5&`$orderby=creationDateTimeUtc desc"
 
         if ($actionsResult -and $actionsResult.value -and $actionsResult.value.Count -gt 0) {
             Write-Host ""
@@ -3155,8 +1928,7 @@ function Invoke-ResetPasswordAndRevoke {
 
     Write-Host "  [1/3] Resetting AD password..." -ForegroundColor Cyan -NoNewline
     try {
-        $adParams = Get-ADConnectionParams
-        Set-ADAccountPassword @adParams -Identity $ADUser.SamAccountName -NewPassword $securePassword -Reset -ErrorAction Stop
+        Set-ADAccountPassword -Identity $ADUser.SamAccountName -NewPassword $securePassword -Reset -ErrorAction Stop
         Write-Host " Done" -ForegroundColor Green
     }
     catch {
@@ -3167,7 +1939,7 @@ function Invoke-ResetPasswordAndRevoke {
 
     Write-Host "  [2/3] Setting change password at next logon..." -ForegroundColor Cyan -NoNewline
     try {
-        Set-ADUser @adParams -Identity $ADUser.SamAccountName -ChangePasswordAtLogon $true -ErrorAction Stop
+        Set-ADUser -Identity $ADUser.SamAccountName -ChangePasswordAtLogon $true -ErrorAction Stop
         Write-Host " Done" -ForegroundColor Green
     }
     catch {
@@ -3216,8 +1988,7 @@ function Invoke-RequirePasswordChange {
 
     Write-Host "  Setting change password at next logon..." -ForegroundColor Cyan -NoNewline
     try {
-        $adParams = Get-ADConnectionParams
-        Set-ADUser @adParams -Identity $ADUser.SamAccountName -ChangePasswordAtLogon $true -ErrorAction Stop
+        Set-ADUser -Identity $ADUser.SamAccountName -ChangePasswordAtLogon $true -ErrorAction Stop
         Write-Host " Done" -ForegroundColor Green
     }
     catch {
@@ -3255,8 +2026,7 @@ function Invoke-DisableAndRevoke {
     if ($ADUser) {
         Write-Host "  [1/2] Disabling AD account..." -ForegroundColor Cyan -NoNewline
         try {
-            $adParams = Get-ADConnectionParams
-            Disable-ADAccount @adParams -Identity $ADUser.SamAccountName -ErrorAction Stop
+            Disable-ADAccount -Identity $ADUser.SamAccountName -ErrorAction Stop
             Write-Host " Done" -ForegroundColor Green
         }
         catch {
@@ -3392,536 +2162,84 @@ function Invoke-UnisolateDevice {
 # FUNCTIONS -- DEVICE ACTION MENU (shared by user-context & device-search flows)
 # ==============================================================================
 
-function Invoke-OffboardDevice {
-    <#
-    .SYNOPSIS
-        Composite "Offboard Device" workflow that chains the appropriate steps
-        based on device ownership and what services the device is enrolled in.
-
-        Steps (each prompted individually):
-          1. Intune action -- Corporate: Wipe or Retire; Personal: Retire
-          2. MDE isolation (if onboarded)
-          3. Disable Entra device object
-          4. Revoke user sign-in sessions
-
-        The operator is asked at each step whether to proceed or skip.
-    #>
-    param(
-        $EntraDevice,     # May be $null if from MDE search
-        $IntuneDevice,    # May be $null if not enrolled
-        $MDEMachine,      # May be $null if not onboarded
-        $User             # May be $null if from MDE search; needed for session revocation
-    )
-
-    $deviceName = "Unknown"
-    if ($EntraDevice -and $EntraDevice.DisplayName)       { $deviceName = $EntraDevice.DisplayName }
-    elseif ($IntuneDevice -and $IntuneDevice.deviceName)  { $deviceName = $IntuneDevice.deviceName }
-    elseif ($MDEMachine -and $MDEMachine.computerDnsName) { $deviceName = $MDEMachine.computerDnsName }
-
-    Write-Host ""
-    Write-Host "  ========================================================" -ForegroundColor Red
-    Write-Host "  OFFBOARD DEVICE" -ForegroundColor Red
-    Write-Host "  ========================================================" -ForegroundColor Red
-    Write-Host "  Device: $deviceName" -ForegroundColor White
-
-    # -- Determine ownership and OS from Intune if available -------------------
-    $isCorporate = $false
-    $ownerLabel  = "Unknown"
-    $osLabel     = "Unknown"
-
-    if ($IntuneDevice) {
-        $isCorporate = ($IntuneDevice.managedDeviceOwnerType -eq "company")
-        $ownerLabel  = if ($isCorporate) { "Corporate" } else { "Personal / BYOD" }
-        $osLabel     = if ($IntuneDevice.operatingSystem) { $IntuneDevice.operatingSystem } else { "Unknown" }
-    }
-    elseif ($EntraDevice) {
-        # Infer from trust type if no Intune record
-        $isCorporate = ($EntraDevice.TrustType -eq "AzureAd" -and $EntraDevice.ProfileType -eq "RegisteredDevice") -or
-                       ($EntraDevice.TrustType -eq "ServerAd")
-        $ownerLabel  = if ($isCorporate) { "Corporate (inferred)" } else { "Personal / BYOD (inferred)" }
-        $osLabel     = if ($EntraDevice.OperatingSystem) { $EntraDevice.OperatingSystem } else { "Unknown" }
-    }
-
-    Write-Host "  Ownership: $ownerLabel" -ForegroundColor $(if ($isCorporate) { "Cyan" } else { "Yellow" })
-    Write-Host "  OS: $osLabel" -ForegroundColor White
-
-    # Show what services the device is known to
-    $inServices = @()
-    if ($EntraDevice)   { $inServices += "Entra ID" }
-    if ($IntuneDevice)  { $inServices += "Intune" }
-    if ($MDEMachine)    { $inServices += "MDE" }
-    Write-Host "  Enrolled in: $($inServices -join ', ')" -ForegroundColor White
-    Write-Host ""
-
-    Write-Host "  This workflow will walk you through each offboarding step." -ForegroundColor DarkGray
-    Write-Host "  You can skip any step by answering N." -ForegroundColor DarkGray
-    Write-Host ""
-
-    $overallConfirm = Read-Host "  Begin offboarding? (Y/N)"
-    if ($overallConfirm -ne "Y" -and $overallConfirm -ne "y") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        return
-    }
-
-    $stepNum = 1
-
-    # ==========================================================================
-    # STEP: Intune action (Wipe / Retire)
-    # ==========================================================================
-    if ($IntuneDevice) {
-        Write-Host ""
-        Write-Host "  -- Step $stepNum : Intune Device Action --" -ForegroundColor Yellow
-        $stepNum++
-
-        if ($isCorporate) {
-            Write-Host "  Corporate device: you can Wipe (factory reset) or Retire (remove company data)." -ForegroundColor White
-            Write-Host "    [W] Wipe   - factory reset, removes ALL data" -ForegroundColor Red
-            Write-Host "    [R] Retire - removes company data/apps/profiles only" -ForegroundColor Yellow
-            Write-Host "    [S] Skip   - do not take any Intune action" -ForegroundColor DarkGray
-            $intuneChoice = Read-Host "  Choice (W/R/S)"
-
-            switch ($intuneChoice.ToUpper()) {
-                "W" {
-                    Write-Host "  Sending wipe command..." -ForegroundColor Cyan -NoNewline
-                    try {
-                        Invoke-MgGraphRequest -Method POST `
-                            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$($IntuneDevice.id)/wipe" `
-                            -ErrorAction Stop | Out-Null
-                        Write-Host " Done" -ForegroundColor Green
-                    }
-                    catch {
-                        Write-Host " FAILED" -ForegroundColor Red
-                        Write-Warning "    Error: $_"
-                    }
-                }
-                "R" {
-                    Write-Host "  Sending retire command..." -ForegroundColor Cyan -NoNewline
-                    try {
-                        Invoke-MgGraphRequest -Method POST `
-                            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$($IntuneDevice.id)/retire" `
-                            -ErrorAction Stop | Out-Null
-                        Write-Host " Done" -ForegroundColor Green
-                    }
-                    catch {
-                        Write-Host " FAILED" -ForegroundColor Red
-                        Write-Warning "    Error: $_"
-                    }
-                }
-                default {
-                    Write-Host "  Skipped Intune action." -ForegroundColor DarkGray
-                }
-            }
-        }
-        else {
-            # Personal / BYOD -- only Retire is appropriate
-            Write-Host "  Personal device: Retire will remove company data, apps, and profiles." -ForegroundColor White
-            Write-Host "  Personal data on the device will NOT be affected." -ForegroundColor White
-            $retireConfirm = Read-Host "  Retire this device? (Y/N)"
-
-            if ($retireConfirm -eq "Y" -or $retireConfirm -eq "y") {
-                Write-Host "  Sending retire command..." -ForegroundColor Cyan -NoNewline
-                try {
-                    Invoke-MgGraphRequest -Method POST `
-                        -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$($IntuneDevice.id)/retire" `
-                        -ErrorAction Stop | Out-Null
-                    Write-Host " Done" -ForegroundColor Green
-                }
-                catch {
-                    Write-Host " FAILED" -ForegroundColor Red
-                    Write-Warning "    Error: $_"
-                }
-            }
-            else {
-                Write-Host "  Skipped Intune retire." -ForegroundColor DarkGray
-            }
-        }
-    }
-
-    # ==========================================================================
-    # STEP: MDE isolation
-    # ==========================================================================
-    if ($MDEMachine -and $script:mdeAccessToken) {
-        Write-Host ""
-        Write-Host "  -- Step $stepNum : MDE Network Isolation --" -ForegroundColor Yellow
-        $stepNum++
-
-        Write-Host "  Isolate this device from the network?" -ForegroundColor White
-        Write-Host "    [F] Full isolation (device can only reach MDE service)" -ForegroundColor White
-        Write-Host "    [S] Selective isolation (Outlook/Teams/Skype remain)" -ForegroundColor White
-        Write-Host "    [N] Skip -- do not isolate" -ForegroundColor DarkGray
-        $isoChoice = Read-Host "  Choice (F/S/N)"
-
-        switch ($isoChoice.ToUpper()) {
-            "F" {
-                Write-Host "  Sending full isolation request..." -ForegroundColor Cyan -NoNewline
-                $body = @{
-                    Comment       = "Offboarded via User Management Tool"
-                    IsolationType = "Full"
-                }
-                $result = Invoke-MDERequest -Method POST -Endpoint "/api/machines/$($MDEMachine.id)/isolate" -Body $body
-                if ($result) {
-                    Write-Host " Submitted (Status: $($result.status))" -ForegroundColor Green
-                } else {
-                    Write-Host " FAILED" -ForegroundColor Red
-                }
-            }
-            "S" {
-                Write-Host "  Sending selective isolation request..." -ForegroundColor Cyan -NoNewline
-                $body = @{
-                    Comment       = "Offboarded via User Management Tool"
-                    IsolationType = "Selective"
-                }
-                $result = Invoke-MDERequest -Method POST -Endpoint "/api/machines/$($MDEMachine.id)/isolate" -Body $body
-                if ($result) {
-                    Write-Host " Submitted (Status: $($result.status))" -ForegroundColor Green
-                } else {
-                    Write-Host " FAILED" -ForegroundColor Red
-                }
-            }
-            default {
-                Write-Host "  Skipped MDE isolation." -ForegroundColor DarkGray
-            }
-        }
-    }
-
-    # ==========================================================================
-    # STEP: Disable Entra device object
-    # ==========================================================================
-    if ($EntraDevice -and $EntraDevice.Id) {
-        Write-Host ""
-        Write-Host "  -- Step $stepNum : Disable Entra Device Object --" -ForegroundColor Yellow
-        $stepNum++
-
-        $currentlyEnabled = $EntraDevice.AccountEnabled
-        if ($currentlyEnabled -eq $false) {
-            Write-Host "  Device is already disabled in Entra ID." -ForegroundColor DarkGray
-        }
-        else {
-            Write-Host "  This will set AccountEnabled = false on the Entra device object." -ForegroundColor White
-            Write-Host "  The device will no longer be able to authenticate against Entra ID." -ForegroundColor White
-            $disableConfirm = Read-Host "  Disable Entra device object? (Y/N)"
-
-            if ($disableConfirm -eq "Y" -or $disableConfirm -eq "y") {
-                Write-Host "  Disabling Entra device object..." -ForegroundColor Cyan -NoNewline
-                try {
-                    $body = @{ accountEnabled = $false } | ConvertTo-Json
-                    Invoke-MgGraphRequest -Method PATCH `
-                        -Uri "https://graph.microsoft.com/v1.0/devices/$($EntraDevice.Id)" `
-                        -Body $body -ContentType "application/json" `
-                        -ErrorAction Stop | Out-Null
-                    Write-Host " Done" -ForegroundColor Green
-
-                    # Update local object so the display refreshes correctly
-                    $EntraDevice | Add-Member -NotePropertyName 'AccountEnabled' -NotePropertyValue $false -Force
-                }
-                catch {
-                    Write-Host " FAILED" -ForegroundColor Red
-                    Write-Warning "    Error: $_"
-                }
-            }
-            else {
-                Write-Host "  Skipped disabling Entra device." -ForegroundColor DarkGray
-            }
-        }
-    }
-
-    # ==========================================================================
-    # STEP: Revoke user sign-in sessions
-    # ==========================================================================
-
-    # Resolve user if not provided (e.g. came from device search)
-    $revokeUserId  = $null
-    $revokeUserUPN = $null
-
-    if ($User -and $User.Id) {
-        $revokeUserId  = $User.Id
-        $revokeUserUPN = if ($User.UPN) { $User.UPN } else { $User.Id }
-    }
-    elseif ($EntraDevice -and $EntraDevice.Id) {
-        # Try to look up the registered owner from the Entra device
-        try {
-            $owners = Get-MgDeviceRegisteredOwner -DeviceId $EntraDevice.Id -ErrorAction Stop
-            if ($owners -and $owners.Count -gt 0) {
-                $ownerId = $owners[0].Id
-                $ownerUser = Get-MgUser -UserId $ownerId -Property "id","userPrincipalName" -ErrorAction Stop
-                if ($ownerUser) {
-                    $revokeUserId  = $ownerUser.Id
-                    $revokeUserUPN = $ownerUser.UserPrincipalName
-                }
-            }
-        }
-        catch {
-            # Could not resolve owner -- will skip session revocation
-        }
-    }
-
-    if ($revokeUserId) {
-        Write-Host ""
-        Write-Host "  -- Step $stepNum : Revoke Sign-In Sessions --" -ForegroundColor Yellow
-        $stepNum++
-
-        Write-Host "  This will invalidate all refresh tokens and session cookies" -ForegroundColor White
-        Write-Host "  for user: $revokeUserUPN" -ForegroundColor White
-        Write-Host "  The user will be forced to re-authenticate everywhere." -ForegroundColor White
-        $revokeConfirm = Read-Host "  Revoke all sign-in sessions? (Y/N)"
-
-        if ($revokeConfirm -eq "Y" -or $revokeConfirm -eq "y") {
-            Write-Host "  Revoking sessions..." -ForegroundColor Cyan -NoNewline
-            try {
-                $revokeUri = "https://graph.microsoft.com/v1.0/users/$revokeUserId/revokeSignInSessions"
-                Invoke-MgGraphRequest -Method POST -Uri $revokeUri -ErrorAction Stop | Out-Null
-                Write-Host " Done" -ForegroundColor Green
-            }
-            catch {
-                Write-Host " FAILED" -ForegroundColor Red
-                Write-Warning "    Error: $_"
-            }
-        }
-        else {
-            Write-Host "  Skipped session revocation." -ForegroundColor DarkGray
-        }
-    }
-    else {
-        Write-Host ""
-        Write-Host "  -- Step $stepNum : Revoke Sign-In Sessions --" -ForegroundColor Yellow
-        $stepNum++
-        Write-Host "  Could not determine the device owner. Skipping session revocation." -ForegroundColor DarkGray
-        Write-Host "  You can revoke sessions manually from the user search menu." -ForegroundColor DarkGray
-    }
-
-    # ==========================================================================
-    # Summary
-    # ==========================================================================
-    Write-Host ""
-    Write-Host "  ========================================================" -ForegroundColor Green
-    Write-Host "  Offboarding workflow complete for: $deviceName" -ForegroundColor Green
-    Write-Host "  ========================================================" -ForegroundColor Green
-    Write-Host ""
-}
-
 function Show-DeviceActionMenu {
     <#
     .SYNOPSIS
-        Displays device detail and an action menu for a single device.
-        Adapts to what is available:
-          - Entra device properties (always, if EntraDevice is provided)
-          - Intune managed device detail + actions (if enrolled in Intune)
-          - MDE device detail + isolation actions (if onboarded to MDE)
-        Includes a composite "Offboard Device" workflow that chains
-        the appropriate steps based on device category.
+        Displays MDE device detail and an action menu for a single device.
         Used both from the user-device drill-down and from standalone device search.
         Returns when the user chooses to go back.
     #>
     param(
         $EntraDevice,   # May be $null if from device search
-        $MDEMachine,    # May be $null if device isn't in MDE
-        $User           # May be $null if from device search; used for session revocation
+        $MDEMachine     # May be $null if device isn't in MDE
     )
 
-    $backToParent   = $false
-    $intuneDevice   = $null
-    $intuneLookedUp = $false
-    $mdeLookedUp    = $false
+    $backToParent = $false
 
     while (-not $backToParent) {
 
-        # -- Resolve MDE machine (once) ----------------------------------------
-        if (-not $MDEMachine -and -not $mdeLookedUp -and $EntraDevice -and $EntraDevice.DeviceId -and $script:mdeAccessToken) {
+        # Resolve MDE machine if we have an Entra device but no MDE machine yet
+        if (-not $MDEMachine -and $EntraDevice -and $EntraDevice.DeviceId -and $script:mdeAccessToken) {
             Write-Host "  Looking up device in MDE..." -ForegroundColor Cyan
             $MDEMachine = Get-MDEMachineByAADDeviceId -AADDeviceId $EntraDevice.DeviceId
-            $mdeLookedUp = $true
         }
 
-        # -- Resolve Intune managed device (once) ------------------------------
-        if (-not $intuneDevice -and -not $intuneLookedUp -and $EntraDevice -and $EntraDevice.DeviceId) {
-            Write-Host "  Looking up device in Intune..." -ForegroundColor Cyan
-            $intuneDevice = Get-IntuneManagedDevice -AADDeviceId $EntraDevice.DeviceId
-            $intuneLookedUp = $true
-        }
-
-        # -- Display detail sections -------------------------------------------
-
-        # Entra detail (always show if we have the Entra object)
-        if ($EntraDevice) {
-            Show-EntraDeviceDetail -Device $EntraDevice
-        }
-
-        # Intune detail
-        if ($intuneDevice) {
-            Show-IntuneDeviceDetail -ManagedDevice $intuneDevice
-        }
-        elseif ($intuneLookedUp -and $EntraDevice) {
-            Write-Host ""
-            Write-Host "  -- Intune Managed Device Detail --" -ForegroundColor Magenta
-            Write-Host "  Device not enrolled in Intune (or no Intune licence)." -ForegroundColor DarkGray
-        }
-
-        # MDE detail
         if ($MDEMachine) {
             Show-MDEDeviceDetail -Machine $MDEMachine
         }
-        elseif ($mdeLookedUp) {
+        elseif ($script:mdeAccessToken) {
             Write-Host ""
             Write-Host "  -- MDE Device Detail --" -ForegroundColor Magenta
-            Write-Host "  Device not onboarded to MDE." -ForegroundColor DarkGray
-        }
-        elseif (-not $script:mdeAccessToken -and -not $MDEMachine) {
-            Write-Host ""
-            Write-Host "  -- MDE Device Detail --" -ForegroundColor Magenta
-            Write-Host "  MDE is not connected. Connect from the main menu to see MDE detail." -ForegroundColor DarkGray
+            Write-Host "  Device not found in MDE (not onboarded or ID mismatch)." -ForegroundColor DarkGray
         }
 
-        # Network / Location (consolidated from MDE + sign-in logs)
-        Show-DeviceNetworkLocation -EntraDevice $EntraDevice -IntuneDevice $intuneDevice -MDEMachine $MDEMachine -User $User
-
-        # -- Build action menu dynamically -------------------------------------
         Write-Host ""
         Write-Host "  -- DEVICE ACTIONS --" -ForegroundColor Yellow
 
-        $hasMDE    = ($null -ne $script:mdeAccessToken) -and ($null -ne $MDEMachine)
-        $hasIntune = ($null -ne $intuneDevice)
-
-        $menuIndex  = 1
-        $actionMap  = @{}   # maps displayed number -> action key
-
-        # MDE actions
-        if ($hasMDE) {
-            Write-Host "    [$menuIndex] Isolate device (Full)       [MDE]"
-            $actionMap["$menuIndex"] = "mde_isolate_full";  $menuIndex++
-
-            Write-Host "    [$menuIndex] Isolate device (Selective)  [MDE]"
-            $actionMap["$menuIndex"] = "mde_isolate_sel";   $menuIndex++
-
-            Write-Host "    [$menuIndex] Release from isolation      [MDE]"
-            $actionMap["$menuIndex"] = "mde_unisolate";     $menuIndex++
+        if ($script:mdeAccessToken -and $MDEMachine) {
+            Write-Host "    [1] Isolate device (Full)"
+            Write-Host "    [2] Isolate device (Selective)"
+            Write-Host "    [3] Release from isolation"
+            Write-Host "    [4] Refresh"
+            Write-Host "    [5] Back"
+        }
+        elseif (-not $script:mdeAccessToken) {
+            Write-Host "    MDE is not connected. Isolation actions unavailable." -ForegroundColor DarkGray
+            Write-Host "    [4] Refresh"
+            Write-Host "    [5] Back"
         }
         else {
-            if (-not $script:mdeAccessToken) {
-                Write-Host "    MDE not connected -- isolation actions unavailable." -ForegroundColor DarkGray
-            }
-            elseif (-not $MDEMachine) {
-                Write-Host "    Device not in MDE -- isolation actions unavailable." -ForegroundColor DarkGray
-            }
+            Write-Host "    Device not found in MDE. Isolation actions unavailable." -ForegroundColor DarkGray
+            Write-Host "    [4] Refresh"
+            Write-Host "    [5] Back"
         }
-
-        # Intune actions (context-aware based on OS / ownership / supervised)
-        if ($hasIntune) {
-            $intuneDeviceName = if ($intuneDevice.deviceName) { $intuneDevice.deviceName } else { "device" }
-            $intuneActions = Get-IntuneAvailableActions -ManagedDevice $intuneDevice
-
-            # Show device category for clarity
-            $iOS   = if ($intuneDevice.operatingSystem) { $intuneDevice.operatingSystem } else { "Unknown OS" }
-            $iOwn  = if ($intuneDevice.managedDeviceOwnerType -eq 'company') { "Corporate" } else { "Personal" }
-            Write-Host "    Intune ($iOwn $iOS):" -ForegroundColor DarkCyan
-
-            foreach ($ia in $intuneActions) {
-                $padLabel = $ia.Label.PadRight(30)
-                Write-Host "    [$menuIndex] $padLabel [Intune]" -ForegroundColor $ia.Colour
-                $actionMap["$menuIndex"] = $ia.ActionKey; $menuIndex++
-            }
-        }
-        else {
-            if (-not $EntraDevice) {
-                # Came from MDE device search -- no Entra context
-            }
-            elseif ($intuneLookedUp) {
-                Write-Host "    Device not in Intune -- Intune actions unavailable." -ForegroundColor DarkGray
-            }
-        }
-
-        # Separator + Offboard Device composite action
-        if ($hasIntune -or $hasMDE -or $EntraDevice) {
-            Write-Host ""
-            Write-Host "    [$menuIndex] " -NoNewline
-            Write-Host "Offboard Device" -ForegroundColor Red -NoNewline
-            Write-Host "                [Composite]" -ForegroundColor DarkGray
-            $actionMap["$menuIndex"] = "offboard"; $menuIndex++
-        }
-
-        # Common actions (always available)
-        Write-Host ""
-        Write-Host "    [$menuIndex] Refresh"
-        $actionMap["$menuIndex"] = "refresh"; $menuIndex++
-
-        Write-Host "    [$menuIndex] Back"
-        $actionMap["$menuIndex"] = "back";    $menuIndex++
-
         Write-Host ""
 
         $deviceAction = Read-Host "  Action"
 
-        $actionKey = $actionMap[$deviceAction]
-
-        switch ($actionKey) {
-            # -- MDE actions --
-            "mde_isolate_full" {
-                Invoke-IsolateDevice -MachineId $MDEMachine.id -MachineName $MDEMachine.computerDnsName -IsolationType "Full"
+        switch ($deviceAction) {
+            "1" {
+                if ($script:mdeAccessToken -and $MDEMachine) {
+                    Invoke-IsolateDevice -MachineId $MDEMachine.id -MachineName $MDEMachine.computerDnsName -IsolationType "Full"
+                } else { Write-Host "  Action unavailable." -ForegroundColor Yellow }
             }
-            "mde_isolate_sel" {
-                Invoke-IsolateDevice -MachineId $MDEMachine.id -MachineName $MDEMachine.computerDnsName -IsolationType "Selective"
+            "2" {
+                if ($script:mdeAccessToken -and $MDEMachine) {
+                    Invoke-IsolateDevice -MachineId $MDEMachine.id -MachineName $MDEMachine.computerDnsName -IsolationType "Selective"
+                } else { Write-Host "  Action unavailable." -ForegroundColor Yellow }
             }
-            "mde_unisolate" {
-                Invoke-UnisolateDevice -MachineId $MDEMachine.id -MachineName $MDEMachine.computerDnsName
+            "3" {
+                if ($script:mdeAccessToken -and $MDEMachine) {
+                    Invoke-UnisolateDevice -MachineId $MDEMachine.id -MachineName $MDEMachine.computerDnsName
+                } else { Write-Host "  Action unavailable." -ForegroundColor Yellow }
             }
-
-            # -- Intune actions --
-            "intune_sync" {
-                Invoke-IntuneSyncDevice -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-            "intune_restart" {
-                Invoke-IntuneRestartDevice -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-            "intune_lock" {
-                Invoke-IntuneRemoteLock -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-            "intune_defender_quick" {
-                Invoke-IntuneDefenderScan -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName -QuickScan $true
-            }
-            "intune_defender_full" {
-                Invoke-IntuneDefenderScan -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName -QuickScan $false
-            }
-            "intune_freshstart" {
-                Invoke-IntuneFreshStart -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-            "intune_lostmode_on" {
-                Invoke-IntuneEnableLostMode -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-            "intune_lostmode_off" {
-                Invoke-IntuneDisableLostMode -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-            "intune_retire" {
-                Invoke-IntuneRetireDevice -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-            "intune_wipe" {
-                Invoke-IntuneWipeDevice -IntuneDeviceId $intuneDevice.id -DeviceName $intuneDevice.deviceName
-            }
-
-            # -- Composite actions --
-            "offboard" {
-                Invoke-OffboardDevice -EntraDevice $EntraDevice -IntuneDevice $intuneDevice -MDEMachine $MDEMachine -User $User
-            }
-
-            # -- Common actions --
-            "refresh" {
-                # Re-fetch MDE data
+            "4" {
                 if ($MDEMachine) {
                     $refreshed = Invoke-MDERequest -Method GET -Endpoint "/api/machines/$($MDEMachine.id)"
                     if ($refreshed) { $MDEMachine = $refreshed }
                 }
-                # Re-fetch Intune data
-                if ($intuneDevice -and $EntraDevice -and $EntraDevice.DeviceId) {
-                    $refreshedIntune = Get-IntuneManagedDevice -AADDeviceId $EntraDevice.DeviceId
-                    if ($refreshedIntune) { $intuneDevice = $refreshedIntune }
-                }
-                # Re-try lookups if first attempt returned nothing
-                if (-not $MDEMachine -and $EntraDevice -and $EntraDevice.DeviceId -and $script:mdeAccessToken) {
-                    $MDEMachine = Get-MDEMachineByAADDeviceId -AADDeviceId $EntraDevice.DeviceId
-                }
-                if (-not $intuneDevice -and $EntraDevice -and $EntraDevice.DeviceId) {
-                    $intuneDevice = Get-IntuneManagedDevice -AADDeviceId $EntraDevice.DeviceId
-                }
             }
-            "back" {
+            "5" {
                 $backToParent = $true
             }
             default {
@@ -3952,7 +2270,6 @@ if (-not $prerequisitesMet) {
 
 # -- Connect to services ------------------------------------------------------
 Connect-ToGraph
-Ensure-GraphCLIConsent
 
 Write-Host ""
 $adConnected = Connect-ToAD
@@ -3992,6 +2309,451 @@ else {
 
 Write-Host ""
 
+# ==============================================================================
+# FUNCTIONS -- MDE INCIDENTS
+# ==============================================================================
+
+function Show-MDEIncidents {
+    <#
+    .SYNOPSIS
+        Lists active (non-resolved) incidents from the MDE / Defender XDR Incidents API.
+        GET /api/incidents?$filter=status eq 'Active'
+        After resolving an incident, automatically refreshes the list.
+    #>
+
+    $refreshList = $true
+
+    while ($refreshList) {
+        $refreshList = $false
+
+        Write-Host ""
+        Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host "  ACTIVE MDE INCIDENTS" -ForegroundColor Cyan
+        Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host "  Fetching active incidents..." -ForegroundColor DarkCyan
+
+        $result = Invoke-MDERequest -Method GET `
+            -Endpoint "/api/incidents?`$filter=status eq 'Active'&`$top=50"
+
+        if (-not $result -or -not $result.value -or $result.value.Count -eq 0) {
+            Write-Host "  No active incidents found." -ForegroundColor Green
+            return
+        }
+
+        $incidents = @($result.value)
+
+        # Sort: High → Medium → Low → Informational
+        $severityOrder = @{ "High" = 0; "Medium" = 1; "Low" = 2; "Informational" = 3 }
+        $incidents = $incidents | Sort-Object {
+            if ($severityOrder.ContainsKey($_.severity)) { $severityOrder[$_.severity] } else { 99 }
+        }, { $_.lastUpdateTime } -Descending
+
+        Write-Host ""
+        Write-Host "  Found $($incidents.Count) active incident(s):" -ForegroundColor Yellow
+        Write-Host ""
+
+        $i = 1
+        foreach ($inc in $incidents) {
+            $sevColour = switch ($inc.severity) {
+                "High"          { "Red" }
+                "Medium"        { "Yellow" }
+                "Low"           { "Cyan" }
+                "Informational" { "DarkGray" }
+                default         { "White" }
+            }
+
+            $incName     = if ($inc.incidentName)  { $inc.incidentName }  else { "(unnamed)" }
+            $incId       = $inc.incidentId
+            $incSev      = if ($inc.severity)      { $inc.severity }      else { "--" }
+            $alertCount  = if ($inc.alerts)         { $inc.alerts.Count }  else { 0 }
+            $assignee    = if ($inc.assignedTo)     { $inc.assignedTo }    else { "Unassigned" }
+            $created     = if ($inc.createdTime)    { try { ([datetime]$inc.createdTime).ToString("yyyy-MM-dd HH:mm") } catch { $inc.createdTime } } else { "--" }
+            $updated     = if ($inc.lastUpdateTime) { try { ([datetime]$inc.lastUpdateTime).ToString("yyyy-MM-dd HH:mm") } catch { $inc.lastUpdateTime } } else { "--" }
+            $classif     = if ($inc.classification -and $inc.classification -ne "Unknown") { $inc.classification } else { "" }
+
+            Write-Host "    [$i] " -ForegroundColor White -NoNewline
+            Write-Host "ID $incId " -ForegroundColor DarkGray -NoNewline
+            Write-Host "$incName" -ForegroundColor White
+            Write-Host "        Severity: " -NoNewline
+            Write-Host "$incSev" -ForegroundColor $sevColour -NoNewline
+            Write-Host "  |  Alerts: $alertCount  |  Assigned: $assignee" -ForegroundColor DarkCyan
+            Write-Host "        Created: $created  |  Updated: $updated" -ForegroundColor DarkGray -NoNewline
+            if ($classif) {
+                Write-Host "  |  Classification: $classif" -ForegroundColor DarkGray
+            } else {
+                Write-Host ""
+            }
+
+            Write-Host ""
+            $i++
+        }
+
+        # -- Detail drill-down loop ------------------------------------------------
+        while ($true) {
+            Write-Host "  Enter an incident number to view details and actions, or type 'BACK' to return." -ForegroundColor DarkGray
+            Write-Host ""
+            $pick = Read-Host "  Select"
+
+            if ([string]::IsNullOrWhiteSpace($pick) -or $pick -eq "BACK" -or $pick -eq "back") {
+                break
+            }
+
+            $pickIdx = 0
+            if (-not [int]::TryParse($pick, [ref]$pickIdx) -or $pickIdx -lt 1 -or $pickIdx -gt $incidents.Count) {
+                Write-Host "  Invalid selection." -ForegroundColor Yellow
+                continue
+            }
+
+            $selInc = $incidents[$pickIdx - 1]
+
+            # -- Inner action loop for the selected incident -----------------------
+            $backToList = $false
+            while (-not $backToList) {
+
+                # Re-fetch the incident to get fresh state
+                $refreshed = Invoke-MDERequest -Method GET -Endpoint "/api/incidents/$($selInc.incidentId)"
+                if ($refreshed) { $selInc = $refreshed }
+
+            Write-Host ""
+            Write-Host "  ========================================================" -ForegroundColor White
+            Write-Host "  INCIDENT $($selInc.incidentId): $($selInc.incidentName)" -ForegroundColor Cyan
+            Write-Host "  ========================================================" -ForegroundColor White
+
+            # Show incident metadata
+            $incAssign = if ($selInc.assignedTo) { $selInc.assignedTo } else { "Unassigned" }
+            $incStatus = if ($selInc.status)     { $selInc.status }     else { "--" }
+            $incDeterm = if ($selInc.determination -and $selInc.determination -ne "NotAvailable") { $selInc.determination } else { "--" }
+            $incClass  = if ($selInc.classification -and $selInc.classification -ne "Unknown") { $selInc.classification } else { "--" }
+
+            $statusColour = switch ($incStatus) {
+                "Active"     { "Red" }
+                "InProgress" { "Yellow" }
+                "Resolved"   { "Green" }
+                default      { "White" }
+            }
+
+            Write-Host "  Severity:       " -NoNewline
+            $sevC = switch ($selInc.severity) { "High" { "Red" } "Medium" { "Yellow" } "Low" { "Cyan" } default { "White" } }
+            Write-Host "$($selInc.severity)" -ForegroundColor $sevC
+            Write-Host "  Status:         " -NoNewline
+            Write-Host "$incStatus" -ForegroundColor $statusColour
+            Write-Host "  Assigned to:    $incAssign"
+            Write-Host "  Classification: $incClass"
+            Write-Host "  Determination:  $incDeterm"
+
+            if ($selInc.tags -and $selInc.tags.Count -gt 0) {
+                Write-Host "  Tags:           $($selInc.tags -join ', ')" -ForegroundColor DarkCyan
+            }
+
+            # Show alerts belonging to this incident
+            $alerts = @($selInc.alerts)
+            if ($alerts.Count -eq 0) {
+                Write-Host ""
+                Write-Host "  No alerts embedded in this incident." -ForegroundColor DarkGray
+            } else {
+                Write-Host ""
+                Write-Host "  -- Alerts ($($alerts.Count)) --" -ForegroundColor DarkCyan
+
+                foreach ($alert in $alerts) {
+                    $aSev = if ($alert.severity) { $alert.severity } else { "--" }
+                    $aSevColour = switch ($aSev) {
+                        "High"          { "Red" }
+                        "Medium"        { "Yellow" }
+                        "Low"           { "Cyan" }
+                        "Informational" { "DarkGray" }
+                        default         { "White" }
+                    }
+                    $aStatus = if ($alert.status) { $alert.status } else { "--" }
+                    $aTitle  = if ($alert.title)  { $alert.title }  else { "(no title)" }
+                    $aCat    = if ($alert.category) { $alert.category } else { "" }
+                    $aSource = if ($alert.serviceSource) { $alert.serviceSource } else { if ($alert.detectionSource) { $alert.detectionSource } else { "" } }
+
+                    Write-Host "    - " -NoNewline
+                    Write-Host "[$aSev]" -ForegroundColor $aSevColour -NoNewline
+                    Write-Host " $aTitle" -ForegroundColor White -NoNewline
+                    Write-Host "  ($aStatus)" -ForegroundColor DarkGray
+
+                    $metaParts = @()
+                    if ($aCat)    { $metaParts += "Category: $aCat" }
+                    if ($aSource) { $metaParts += "Source: $aSource" }
+                    if ($alert.alertId) { $metaParts += "AlertID: $($alert.alertId)" }
+                    if ($metaParts.Count -gt 0) {
+                        Write-Host "      $($metaParts -join '  |  ')" -ForegroundColor DarkGray
+                    }
+
+                    # Show devices involved in the alert
+                    if ($alert.devices -and $alert.devices.Count -gt 0) {
+                        foreach ($dev in $alert.devices) {
+                            $devName = if ($dev.deviceDnsName) { $dev.deviceDnsName } else { $dev.DeviceId }
+                            $devOS   = if ($dev.osPlatform) { " ($($dev.osPlatform))" } else { "" }
+                            Write-Host "      Device: $devName$devOS" -ForegroundColor DarkGray
+                        }
+                    }
+                }
+            }
+
+            # Show comments if any
+            if ($selInc.comments -and $selInc.comments.Count -gt 0) {
+                Write-Host ""
+                Write-Host "  -- Comments --" -ForegroundColor DarkCyan
+                foreach ($comment in $selInc.comments) {
+                    $cBy   = if ($comment.createdBy) { $comment.createdBy } else { "Unknown" }
+                    $cTime = if ($comment.createdTime) { try { ([datetime]$comment.createdTime).ToString("yyyy-MM-dd HH:mm") } catch { $comment.createdTime } } else { "" }
+                    Write-Host "    [$cBy - $cTime]" -ForegroundColor DarkGray
+                    Write-Host "    $($comment.comment)"
+                }
+            }
+
+            # -- Action menu ---------------------------------------------------
+            Write-Host ""
+            Write-Host "  -- Actions --" -ForegroundColor Cyan
+            Write-Host "    [1] Assign to myself"
+            Write-Host "    [2] Assign to someone else"
+            Write-Host "    [3] Update status"
+            Write-Host "    [4] Close incident (Resolve)"
+            Write-Host "    [5] Back to incident list"
+            Write-Host ""
+
+            $actionPick = Read-Host "  Action"
+
+            switch ($actionPick) {
+
+                # ==============================================================
+                # [1] ASSIGN TO MYSELF
+                # ==============================================================
+                "1" {
+                    $myUpn = $null
+                    try {
+                        $ctx = Get-MgContext
+                        if ($ctx -and $ctx.Account) { $myUpn = $ctx.Account }
+                    } catch {}
+
+                    if (-not $myUpn) {
+                        Write-Host "  Could not determine your UPN from the current Graph session." -ForegroundColor Yellow
+                        $myUpn = Read-Host "  Enter your email / UPN"
+                        if ([string]::IsNullOrWhiteSpace($myUpn)) {
+                            Write-Host "  Cancelled." -ForegroundColor DarkGray
+                            continue
+                        }
+                    }
+
+                    Write-Host "  Assigning incident $($selInc.incidentId) to $myUpn..." -ForegroundColor Cyan
+                    $updateBody = @{ assignedTo = $myUpn }
+
+                    $commentText = Read-Host "  Add a comment (optional, press Enter to skip)"
+                    if (-not [string]::IsNullOrWhiteSpace($commentText)) {
+                        $updateBody.comment = $commentText
+                    }
+
+                    $result = Invoke-MDERequest -Method PATCH `
+                        -Endpoint "/api/incidents/$($selInc.incidentId)" -Body $updateBody
+
+                    if ($result) {
+                        Write-Host "  Incident assigned to $myUpn." -ForegroundColor Green
+                    } else {
+                        Write-Host "  Failed to assign incident." -ForegroundColor Red
+                    }
+                }
+
+                # ==============================================================
+                # [2] ASSIGN TO SOMEONE ELSE
+                # ==============================================================
+                "2" {
+                    $targetUpn = Read-Host "  Enter the assignee's email / UPN"
+                    if ([string]::IsNullOrWhiteSpace($targetUpn)) {
+                        Write-Host "  Cancelled." -ForegroundColor DarkGray
+                        continue
+                    }
+
+                    Write-Host "  Assigning incident $($selInc.incidentId) to $targetUpn..." -ForegroundColor Cyan
+                    $updateBody = @{ assignedTo = $targetUpn }
+
+                    $commentText = Read-Host "  Add a comment (optional, press Enter to skip)"
+                    if (-not [string]::IsNullOrWhiteSpace($commentText)) {
+                        $updateBody.comment = $commentText
+                    }
+
+                    $result = Invoke-MDERequest -Method PATCH `
+                        -Endpoint "/api/incidents/$($selInc.incidentId)" -Body $updateBody
+
+                    if ($result) {
+                        Write-Host "  Incident assigned to $targetUpn." -ForegroundColor Green
+                    } else {
+                        Write-Host "  Failed to assign incident." -ForegroundColor Red
+                    }
+                }
+
+                # ==============================================================
+                # [3] UPDATE STATUS
+                # ==============================================================
+                "3" {
+                    Write-Host ""
+                    Write-Host "  Set status to:" -ForegroundColor Cyan
+                    Write-Host "    [1] Active"
+                    Write-Host "    [2] In Progress"
+                    Write-Host "    [3] Cancel"
+                    Write-Host ""
+                    $statusPick = Read-Host "  Select"
+
+                    $newStatus = switch ($statusPick) {
+                        "1" { "Active" }
+                        "2" { "InProgress" }
+                        default { $null }
+                    }
+
+                    if (-not $newStatus) {
+                        Write-Host "  Cancelled." -ForegroundColor DarkGray
+                        continue
+                    }
+
+                    Write-Host "  Setting status to '$newStatus'..." -ForegroundColor Cyan
+                    $updateBody = @{ status = $newStatus }
+
+                    $commentText = Read-Host "  Add a comment (optional, press Enter to skip)"
+                    if (-not [string]::IsNullOrWhiteSpace($commentText)) {
+                        $updateBody.comment = $commentText
+                    }
+
+                    $result = Invoke-MDERequest -Method PATCH `
+                        -Endpoint "/api/incidents/$($selInc.incidentId)" -Body $updateBody
+
+                    if ($result) {
+                        Write-Host "  Status updated to '$newStatus'." -ForegroundColor Green
+                    } else {
+                        Write-Host "  Failed to update status." -ForegroundColor Red
+                    }
+                }
+
+                # ==============================================================
+                # [4] CLOSE INCIDENT (RESOLVE)
+                # ==============================================================
+                "4" {
+                    Write-Host ""
+                    Write-Host "  Classification:" -ForegroundColor Cyan
+                    Write-Host "    [1] True Positive"
+                    Write-Host "    [2] Informational / Expected Activity"
+                    Write-Host "    [3] False Positive"
+                    Write-Host "    [4] Cancel"
+                    Write-Host ""
+                    $classPick = Read-Host "  Select"
+
+                    $classification  = $null
+                    $determinations  = $null
+
+                    switch ($classPick) {
+                        "1" {
+                            $classification = "TruePositive"
+                            $determinations = [ordered]@{
+                                "1" = @{ Label = "Multi-staged attack";     Value = "MultiStagedAttack" }
+                                "2" = @{ Label = "Malicious user activity"; Value = "MaliciousUserActivity" }
+                                "3" = @{ Label = "Compromised account";     Value = "CompromisedAccount" }
+                                "4" = @{ Label = "Malware";                 Value = "Malware" }
+                                "5" = @{ Label = "Phishing";                Value = "Phishing" }
+                                "6" = @{ Label = "Unwanted software";       Value = "UnwantedSoftware" }
+                                "7" = @{ Label = "Other";                   Value = "Other" }
+                            }
+                        }
+                        "2" {
+                            $classification = "InformationalExpectedActivity"
+                            $determinations = [ordered]@{
+                                "1" = @{ Label = "Security test";           Value = "SecurityTesting" }
+                                "2" = @{ Label = "Line-of-business app";    Value = "LineOfBusinessApplication" }
+                                "3" = @{ Label = "Confirmed activity";      Value = "ConfirmedActivity" }
+                                "4" = @{ Label = "Other";                   Value = "Other" }
+                            }
+                        }
+                        "3" {
+                            $classification = "FalsePositive"
+                            $determinations = [ordered]@{
+                                "1" = @{ Label = "Not malicious";              Value = "Clean" }
+                                "2" = @{ Label = "Not enough data to validate"; Value = "NoEnoughDataToValidate" }
+                                "3" = @{ Label = "Other";                       Value = "Other" }
+                            }
+                        }
+                        default {
+                            Write-Host "  Cancelled." -ForegroundColor DarkGray
+                            continue
+                        }
+                    }
+
+                    # Prompt for determination
+                    Write-Host ""
+                    Write-Host "  Determination:" -ForegroundColor Cyan
+                    foreach ($key in $determinations.Keys) {
+                        Write-Host "    [$key] $($determinations[$key].Label)"
+                    }
+                    $cancelKey = ([int]($determinations.Keys | Select-Object -Last 1) + 1).ToString()
+                    Write-Host "    [$cancelKey] Cancel"
+                    Write-Host ""
+                    $determPick = Read-Host "  Select"
+
+                    if (-not $determinations.Contains($determPick)) {
+                        Write-Host "  Cancelled." -ForegroundColor DarkGray
+                        continue
+                    }
+
+                    $determination = $determinations[$determPick].Value
+
+                    # Confirmation
+                    Write-Host ""
+                    Write-Host "  You are about to RESOLVE incident $($selInc.incidentId):" -ForegroundColor Yellow
+                    Write-Host "    Classification: $classification"
+                    Write-Host "    Determination:  $determination ($($determinations[$determPick].Label))"
+                    Write-Host ""
+                    $confirm = Read-Host "  Proceed? (Y/N)"
+
+                    if ($confirm -ne "Y" -and $confirm -ne "y") {
+                        Write-Host "  Cancelled." -ForegroundColor DarkGray
+                        continue
+                    }
+
+                    $updateBody = @{
+                        status         = "Resolved"
+                        classification = $classification
+                        determination  = $determination
+                    }
+
+                    $commentText = Read-Host "  Add a closing comment (optional, press Enter to skip)"
+                    if (-not [string]::IsNullOrWhiteSpace($commentText)) {
+                        $updateBody.comment = $commentText
+                    }
+
+                    Write-Host "  Resolving incident $($selInc.incidentId)..." -ForegroundColor Cyan
+                    $result = Invoke-MDERequest -Method PATCH `
+                        -Endpoint "/api/incidents/$($selInc.incidentId)" -Body $updateBody
+
+                    if ($result) {
+                        Write-Host "  Incident $($selInc.incidentId) resolved." -ForegroundColor Green
+                        Write-Host ""
+                        Write-Host "  Returning to incident list..." -ForegroundColor DarkCyan
+                        $backToList  = $true
+                        $refreshList = $true
+                    } else {
+                        Write-Host "  Failed to resolve incident." -ForegroundColor Red
+                    }
+                }
+
+                # ==============================================================
+                # [5] BACK TO INCIDENT LIST
+                # ==============================================================
+                "5" {
+                    $backToList = $true
+                }
+
+                default {
+                    Write-Host "  Invalid option." -ForegroundColor Yellow
+                }
+
+            } # end action switch
+        } # end inner action loop
+
+        # If an incident was resolved, break the drill-down loop to refresh the list
+        if ($refreshList) { break }
+
+    } # end outer selection loop
+    } # end refreshList loop
+}
+
 # -- Main loop -----------------------------------------------------------------
 $exitScript = $false
 
@@ -4008,12 +2770,7 @@ while (-not $exitScript) {
         Write-Host "    [3] Connect to MDE" -ForegroundColor Yellow
     }
 
-    if ($adConnected) {
-        Write-Host "    [4] Reconnect to AD" -ForegroundColor DarkGray
-    } else {
-        Write-Host "    [4] Connect to AD" -ForegroundColor Yellow
-    }
-
+    Write-Host "    [4] View active incidents (MDE)" -ForegroundColor $(if ($mdeConnected) { "White" } else { "DarkGray" })
     Write-Host "    [5] Exit"
     Write-Host ""
 
@@ -4177,8 +2934,7 @@ while (-not $exitScript) {
                         else {
                             Write-Host "  Unlocking AD account..." -ForegroundColor Cyan -NoNewline
                             try {
-                                $adParams = Get-ADConnectionParams
-                                Unlock-ADAccount @adParams -Identity $adUser.SamAccountName -ErrorAction Stop
+                                Unlock-ADAccount -Identity $adUser.SamAccountName -ErrorAction Stop
                                 Write-Host " Done" -ForegroundColor Green
                             }
                             catch {
@@ -4214,7 +2970,7 @@ while (-not $exitScript) {
                                     $mdeMachine = Get-MDEMachineByAADDeviceId -AADDeviceId $selectedDevice.DeviceId
                                 }
 
-                                Show-DeviceActionMenu -EntraDevice $selectedDevice -MDEMachine $mdeMachine -User $selectedUser
+                                Show-DeviceActionMenu -EntraDevice $selectedDevice -MDEMachine $mdeMachine
                             }
                             else {
                                 Write-Host "  Invalid device selection." -ForegroundColor Yellow
@@ -4368,16 +3124,16 @@ while (-not $exitScript) {
     }
 
     # ======================================================================
-    # [4] CONNECT / RECONNECT AD
+    # [4] VIEW ACTIVE INCIDENTS (MDE)
     # ======================================================================
     "4" {
-        $adConnected = Connect-ToAD
-        if ($adConnected) {
-            Write-Host "  Active Directory is now available." -ForegroundColor Green
+        if (-not $mdeConnected) {
+            Write-Host "  MDE is not connected. Cannot view incidents." -ForegroundColor Yellow
+            Write-Host "  Use option [3] from the main menu to connect to MDE." -ForegroundColor DarkGray
+            continue
         }
-        else {
-            Write-Host "  AD connection failed. AD actions will remain unavailable." -ForegroundColor Yellow
-        }
+
+        Show-MDEIncidents
     }
 
     # ======================================================================
@@ -4406,7 +3162,19 @@ $disconnectChoice = Read-Host "Select an option (1/2)"
 if ($disconnectChoice -eq "1") {
     Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
     Write-Host "Disconnected from Microsoft Graph." -ForegroundColor DarkGray
-    Write-Host "Note: AD connectivity is domain-based and does not require disconnection." -ForegroundColor DarkGray
+
+    # Clear AD default parameter values (Server / Credential) if set
+    $adCmdlets = @(
+        "Get-ADDomain", "Get-ADDomainController", "Get-ADUser",
+        "Set-ADUser", "Set-ADAccountPassword",
+        "Disable-ADAccount", "Unlock-ADAccount"
+    )
+    foreach ($cmd in $adCmdlets) {
+        $PSDefaultParameterValues.Remove("${cmd}:Server")
+        $PSDefaultParameterValues.Remove("${cmd}:Credential")
+    }
+    Write-Host "AD session parameters cleared." -ForegroundColor DarkGray
+
     if ($mdeConnected) {
         Write-Host "MDE token cleared." -ForegroundColor DarkGray
     }
@@ -4429,15 +3197,7 @@ $variablesToClear = @(
     'context', 'ctx', 'needsConnect', 'sessionId', 'id',
     'currentScopes', 'hasUserWrite', 'hasUserRead', 'hasDeviceRead', 'missing',
     'adConnected', 'mdeConnected', 'connectMDE', 'retryMDE', 'domain',
-    'adServer', 'adCredential', 'adServerInput', 'adUsername', 'adPassword',
-    'isAzureADJoined', 'isDomainJoined', 'isHybridJoined', 'dsregOutput',
-    'adDomain', 'joinState', 'adParams',
-    'savedConfig', 'savedDomain', 'savedUsername', 'domainPrompt', 'usernamePrompt',
-    'hasIntuneRead', 'hasIntuneAction', 'hasAuditLog',
-    # Graph CLI consent
-    'graphCLIAppId', 'msGraphAppId', 'cliSPResult', 'cliSP',
-    'graphSPResult', 'graphSP', 'existingGrants', 'existingGrant',
-    'existingScopeList', 'missingScopes', 'newScopeString', 'grantBody',
+    'adConfigPath', 'savedConfig', 'configToSave', 'savedUser', 'adChoice',
     # MDE auth / tokens
     'mdeAccessToken', 'mdeRefreshToken', 'mdeTokenExpiry', 'mdeClientId', 'mdeTokenUrl',
     'mdeMsalParams', 'msalRefreshParams', 'customClientId', 'authMethod',
@@ -4457,15 +3217,6 @@ $variablesToClear = @(
     'searchTerm', 'searchResults', 'searchArray',
     'userChoice', 'selectedIndex', 'selectedUser',
     'adUser', 'samAccount', 'domainDN', 'riskyUser',
-    'signInCutoff', 'signInFilter', 'signInUri', 'signInResult',
-    'si', 'siTime', 'siApp', 'siStatus', 'siStatusColour',
-    'siIP', 'siLoc', 'locParts', 'siDevice', 'devParts',
-    'siCA', 'siCAColour', 'siErrMsg',
-    # Device network/location
-    'mdeIntIP', 'mdeExtIP', 'mdeLastSeen', 'queryUserId', 'upnLookup', 'regOwners',
-    'matchDeviceName', 'matchDeviceId', 'siCutoff', 'siFilter', 'siUri', 'siResult',
-    'deviceSignIns', 'devDetail', 'isMatch', 'seenIPs', 'uniqueEntries',
-    'ipAddr', 'locDisplay', 'latLon', 'lat', 'lon', 'netErrMsg',
     'actionChoice', 'postAction',
     # User actions
     'confirm', 'confirmRevoke', 'confirmDismiss', 'confirmCompromised',
@@ -4487,24 +3238,7 @@ $variablesToClear = @(
     'deviceSearchTerm', 'mdeResults', 'mdeArray',
     'devicePickChoice', 'devPickIdx', 'selectedMDEDevice', 'dNameDisplay',
     'devChoice', 'devIdx', 'selectedDevice', 'deviceName', 'mdeMachine',
-    'deviceAction', 'backToParent', 'actionKey', 'actionMap', 'menuIndex',
-    'hasMDE', 'hasIntune', 'intuneDevice', 'intuneLookedUp', 'mdeLookedUp',
-    'intuneDeviceName', 'refreshedIntune',
-    # Intune display
-    'iName', 'iOS', 'iOSVer', 'iSerial', 'iMfr', 'iModel', 'iHardware',
-    'iOwner', 'iEnrolled', 'iLastSync', 'iUPN', 'iMgmtAgent', 'iCategory',
-    'compState', 'compColour', 'mgmtState', 'mgmtColour',
-    'encrypted', 'encColour', 'supervised',
-    # Intune actions
-    'intuneActions', 'ia', 'iOwn', 'padLabel',
-    'os', 'ownership', 'isCorporate', 'isWinOS', 'isIOS', 'isAndroid',
-    'isMacPlatform', 'isMobile', 'scanType', 'keepData', 'keepUserData', 'keepLabel',
-    'lostMessage', 'lostPhone', 'lostFooter',
-    # Offboard composite
-    'ownerLabel', 'osLabel', 'inServices', 'overallConfirm', 'stepNum',
-    'intuneChoice', 'retireConfirm', 'isoChoice', 'currentlyEnabled',
-    'disableConfirm', 'revokeUserId', 'revokeUserUPN', 'owners', 'ownerId', 'ownerUser',
-    'revokeConfirm',
+    'deviceAction', 'backToParent',
     'mName', 'mOS', 'mVer', 'mBld', 'mOSFull',
     'mHealth', 'mOnboard', 'mRisk', 'mExposure', 'mValue',
     'mIP', 'mExtIP', 'mFirst', 'mLast', 'mAADId', 'mMachId', 'mTags',
